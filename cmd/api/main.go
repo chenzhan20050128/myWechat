@@ -23,6 +23,7 @@ import (
 	"github.com/example/wechat/internal/device"
 	"github.com/example/wechat/internal/group"
 	"github.com/example/wechat/internal/media"
+	"github.com/example/wechat/internal/message"
 	"github.com/example/wechat/internal/platform/cache"
 	"github.com/example/wechat/internal/platform/clock"
 	"github.com/example/wechat/internal/platform/config"
@@ -92,6 +93,8 @@ func main() {
 	})
 	contacts := contact.New(db, users, convs, auditSvc, cacheStore, qrCodec, clk)
 	groups := group.New(db, convs, contacts, nil, clk.Now)
+	messages := message.New(db, contacts, groupMessageAdapter{g: groups}, mediaSvc, convs, clk.Now)
+	groups.SetMessenger(messages)
 
 	// Rate limits (SPEC-12 §7 default table, fail-open).
 	authLimiter := ratelimit.New(cacheStore, "auth", 20, 10*time.Minute)
@@ -100,7 +103,8 @@ func main() {
 	readLimiter := ratelimit.New(cacheStore, "read", 300, time.Minute)
 
 	mux := buildRouter(routerServices{
-		auth: authSvc, devices: devices, users: users, contacts: contacts, groups: groups, media: mediaSvc,
+		auth: authSvc, devices: devices, users: users, contacts: contacts,
+		groups: groups, media: mediaSvc, messages: messages,
 		authn: authSvc,
 		limiters: limiters{auth: authLimiter, write: writeLimiter, chunk: chunkLimiter, read: readLimiter},
 	})
@@ -142,6 +146,7 @@ type routerServices struct {
 	contacts *contact.Service
 	groups   *group.Service
 	media    *media.Service
+	messages *message.Service
 	authn    httpx.Authenticator
 	limiters limiters
 }
@@ -151,6 +156,40 @@ type limiters struct {
 	write *ratelimit.Limiter
 	chunk *ratelimit.Limiter
 	read  *ratelimit.Limiter
+}
+
+// groupMessageAdapter adapts *group.Service to message.Group without importing
+// the group types across modules (ADR-013: message depends on group's surface).
+type groupMessageAdapter struct{ g *group.Service }
+
+func (a groupMessageAdapter) CanSend(ctx context.Context, groupID, userID int64) error {
+	return a.g.CanSend(ctx, groupID, userID)
+}
+func (a groupMessageAdapter) IsModerator(ctx context.Context, groupID, userID int64) (bool, error) {
+	return a.g.IsModerator(ctx, groupID, userID)
+}
+func (a groupMessageAdapter) GroupByConversation(ctx context.Context, conversationID int64) (message.GroupRowView, error) {
+	g, err := a.g.GroupByConversation(ctx, conversationID)
+	if err != nil {
+		return message.GroupRowView{}, err
+	}
+	return message.GroupRowView{
+		GroupID: g.ID, Name: g.Name, Status: g.Status, ConversationID: g.ConversationID,
+	}, nil
+}
+func (a groupMessageAdapter) WasMemberAt(ctx context.Context, groupID, userID int64, at time.Time) (bool, error) {
+	return a.g.WasMemberAt(ctx, groupID, userID, at)
+}
+func (a groupMessageAdapter) ListGroupConversationsForUser(ctx context.Context, userID int64) ([]message.GroupConvView, error) {
+	rows, err := a.g.ListGroupConversationsForUser(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]message.GroupConvView, len(rows))
+	for i, r := range rows {
+		out[i] = message.GroupConvView{ConversationID: r.ConversationID, GroupID: r.GroupID, Name: r.Name}
+	}
+	return out, nil
 }
 
 // limit wraps a handler with a named limiter. The subject is the authenticated
@@ -191,6 +230,7 @@ func buildRouter(s routerServices) http.Handler {
 	contactH := contact.NewHandler(s.contacts)
 	groupH := group.NewHandler(s.groups)
 	mediaH := media.NewHandler(s.media)
+	messageH := message.NewHandler(s.messages)
 	deviceH := device.NewHandler(s.devices)
 
 	mux := http.NewServeMux()
@@ -262,6 +302,9 @@ func buildRouter(s routerServices) http.Handler {
 
 	// Groups (SPEC-05 §5).
 	group.Mount(mux, groupH, authed)
+
+	// Messages (SPEC-04 §5).
+	message.Mount(mux, messageH, authed)
 
 	// Media (SPEC-03 §4).
 	mux.Handle("POST /api/v1/media/uploads", authed(mediaH.CreateUpload))

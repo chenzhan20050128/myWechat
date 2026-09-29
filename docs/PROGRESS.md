@@ -43,7 +43,7 @@
 | 一 | media（上传会话/分片/对象/下载） | ✅ 03 | ✅ | ✅ 单测 + 真实库集成（A1-A6） | **完成**（25 项测试全绿；user 头像绑定已打通） |
 | 一 | cmd/api 路由组装 + docker-compose | ✅ 00 | ✅ | ✅ 真机冒烟（register/login/me/media + 限流） | **完成** |
 | 二 | group（群/二维码/禁言/待办） | ✅ 05 | ✅ | ✅ 规则单测 8 项 + 真实库集成 22 项 | **完成**（B1，R1-R26 全落地） |
-| 二 | message（含 ws 网关/180 天保留） | ✅ 04 | ❌ | ❌ | 任务 B2，依赖 B1 |
+| 二 | message（HTTP 路径 + 180 天保留 worker；WS 网关留 G） | ✅ 04 | ✅ | ✅ 集成 10 项 | **主体完成**；WS 网关在任务 G 随 runtime 落地 |
 | 三 | moment（可见快照/互动/定时发布） | ✅ 06 | ❌ | ❌ | 任务 C |
 | 四 | favorite + cleanup（收藏/存储清理） | ✅ 07 | ❌ | ❌ | 任务 D |
 | 五 | backup（备份/恢复/设备迁移） | ✅ 08 | ❌ | ❌ | 任务 E |
@@ -88,6 +88,19 @@ scripts/       check-boundaries.sh ✅（模块边界断言，CI 必跑）
 ```
 
 ## 5. 会话日志（倒序，每次会话追加一段）
+
+### 会话 7 — 2026-09-29（B2 message HTTP 路径 + 保留 worker 完成）
+- **迁移 00004_message.sql**（已在会话 6 末落地并应用）：messages/message_assets/message_references/message_forwards/message_pins/conversation_settings 6 张表。关键唯一键：`uk_messages_client(sender_id, client_msg_id)`（幂等）、`uk_messages_conv_seq(conversation_id, conversation_seq)`（seq 连续）、`idx_messages_expiry(status, expires_at)`（worker 扫描）。
+- **`internal/message/` 四件套**：
+  - `rules.go`（纯规则）：8 种类型的 payload 校验（text/emoji/image/video/voice/file/card/link/system）、digestOf（≤200 runes 引用快照）、previewOf（≤50 字推送预览）、expiryAt（now+180d）、canRecall（2 分钟窗口）、normalizeHistoryLimit（1..50）。
+  - `store.go`：全部 SQL。两段式发送：`lockConversation FOR UPDATE` → `seq = last_seq+1` → `bumpConversationSeq` → `insertMessage`。recall 用条件 UPDATE（`status IN stored,delivered AND created_at > now-2min`）。conversation_settings 全部 UPSERT（INSERT...ON DUP KEY UPDATE），`last_read_seq = GREATEST(last_read_seq, VALUES(last_read_seq))` 天然只前进（裁决 4）。worker sweep 用 `FOR UPDATE SKIP LOCKED`。
+  - `service.go`：R1-R13、R15-R19、R22、R26 全部落地。端口：`Friend.CanSendMessage`（contact 已实现）、`Group`（在组合根用 `groupMessageAdapter` 适配，避免 group↔message 双向 import）、`Media.AssertReady/OnReferencesRemoved`（本会话给 media 补上）、`Conversation.IsMember`。`SendSystemTx` 实现 group 模块依赖的 `SystemMessenger` 端口——群系统消息与业务 tx 同事务提交（ADR-006）。
+  - `handler.go`：A1-A12 路由全部挂载。所有 int64 id 按 ADR-005 序列化为 JSON string。
+- **新增 `internal/ws/hub.go`**：进程内 `map[userID]map[deviceID]Conn`。Register 自动踢同设备旧连接（R20 4002）；Deliver 慢消费者直接 Close（R25 1024 帧队列上限在 pump 侧）。完整 ws handler（auth 用 `?access_token=` query、ping/pong、ack → MarkDelivered）留到任务 G 与 runtime 一起落地。
+- **新增 `cmd/worker/main.go`**：单进程周期任务，每分钟跑一次消息过期（R26）、群待办 overdue、群禁言 GC、联系人申请过期、上传会话过期。worker 与 api 是两个独立 binary，组合根在各自 main.go（任务 G 抽出共享 composition 包）。
+- **只有真实 MySQL 集成测试才暴露的 1 个根因缺陷**：历史拉取默认（无 after_seq/before_seq）走 `seq < 0` 永远查不到消息。`listMessagesBefore` 拆成独立 SQL：before_seq=0 时不加 `<` 条件，直接取最新 N 条。
+- 验证：10 项集成测试全绿（T1 幂等、T2 非法 payload、T6 并发 50 发送 seq 1..50 无空洞、T7 119s 可撤回/121s 冲突、T8 撤回后 payload=null、T10 pin 第 21 条 QUOTA_EXCEEDED、T12 read cursor 不回退、T13 标未读不动 last_read_seq、T15 181 天后 worker 把消息翻成 expired 且保留行、T18 MarkDelivered 幂等）。边界检查通过；`go build ./...`/`go vet ./...` 干净。
+- **交接点：下一个任务 C=moment（SPEC-06，可见性快照/互动/定时发布）。**
 
 ### 会话 6 — 2026-09-29（B1 group 模块完成）
 - **迁移 00003_group.sql**：10 张表（`groups`/group_members/group_invite_codes/group_invite_uses/group_mutes/group_events/group_todos/group_todo_assignees/group_todo_member_snapshots/group_todo_events）。关键设计：`group_members.active_flag` 生成列（`IF(left_at IS NULL,1,NULL) STORED`）+ `uk_gmembers_active(group_id,user_id,active_flag)` 让 `INSERT IGNORE` 天然幂等（同一用户重复入群不产生多行）；`member_count` 在 `groups` 行上由锁串行维护（≤500，无 oversell）；invite code 用 10 字符 Crockford Base32（`ids.NewInviteCode`），24h TTL，50 uses 原子 `UPDATE ... WHERE use_count<max_uses`；24h ban-rejoin 窗口；mute `until_at` 为 NULL=永远禁言，canSend 以 DB 时间字段为唯一真值（worker 只做 GC，不依赖）。

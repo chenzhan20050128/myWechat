@@ -41,6 +41,10 @@ func New(db *sql.DB, conv Conversation, friend Friend, msg SystemMessenger, now 
 	return &Service{db: db, conv: conv, friend: friend, msg: msg, now: now}
 }
 
+// SetMessenger injects the system-messenger port after both services exist
+// (message depends on group; group depends on message — composition-root cycle).
+func (s *Service) SetMessenger(m SystemMessenger) { s.msg = m }
+
 // CreateInput is the POST /groups body.
 type CreateInput struct {
 	Name           string
@@ -563,6 +567,21 @@ func (s *Service) ListMembers(ctx context.Context, groupID, userID int64) ([]Mem
 // ListMyGroups backs GET /users/me/groups.
 func (s *Service) ListMyGroups(ctx context.Context, userID int64) ([]MyGroupView, error) {
 	return listMyGroups(ctx, s.db, userID)
+}
+
+// GroupByConversation resolves the group row owning `conversationID` (message port).
+func (s *Service) GroupByConversation(ctx context.Context, conversationID int64) (GroupRow, error) {
+	return findGroupByConversation(ctx, s.db, conversationID)
+}
+
+// WasMemberAt reports whether user held an active membership interval at `at` (R15).
+func (s *Service) WasMemberAt(ctx context.Context, groupID, userID int64, at time.Time) (bool, error) {
+	return wasMemberAt(ctx, s.db, groupID, userID, at)
+}
+
+// ListGroupConversationsForUser backs the A3 conversation list for group rows (R19).
+func (s *Service) ListGroupConversationsForUser(ctx context.Context, userID int64) ([]GroupConvView, error) {
+	return listGroupConversationsForUser(ctx, s.db, userID)
 }
 
 // CreateTodoInput is POST /groups/{id}/todos.

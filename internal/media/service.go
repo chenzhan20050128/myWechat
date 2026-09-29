@@ -378,6 +378,47 @@ func (s *Service) BindAvatarTx(ctx context.Context, tx mysqlx.Tx, objectID, user
 	return ensureUserReference(ctx, tx, objectID, userID, refID, s.now.Now())
 }
 
+// AssertReady verifies object is owned by ownerID, status=ready and mime-prefixed
+// by kind (image/video/voice/file/thumb). Called by message on send pre-check (R7).
+func (s *Service) AssertReady(ctx context.Context, ownerID, objectID int64, kind string) error {
+	obj, err := findObject(ctx, s.db, objectID)
+	if err != nil {
+		return err
+	}
+	if obj.OwnerID != ownerID {
+		return apperrors.Unavail("media object not owned by sender")
+	}
+	if obj.Status != "ready" {
+		return apperrors.New(apperrors.StateConflict, "media object not ready")
+	}
+	if kind != "" && !mimeMatches(kind, obj.MIME) {
+		return apperrors.Invalid("media object mime mismatch")
+	}
+	return nil
+}
+
+// OnReferencesRemoved is invoked by the message retention worker when messages
+// referencing these objects expire (R26). V1: no-op GC hook; phase-3 wires the
+// GC queue. Signature kept stable so the message port does not change.
+func (s *Service) OnReferencesRemoved(ctx context.Context, objectIDs []int64) error {
+	return nil
+}
+
+// mimeMatches enforces the kind→mime table from SPEC-04 §3.
+func mimeMatches(kind, mime string) bool {
+	switch kind {
+	case "image":
+		return len(mime) >= 6 && mime[:6] == "image/"
+	case "video":
+		return mime == "video/mp4"
+	case "voice":
+		return len(mime) >= 6 && mime[:6] == "audio/"
+	case "file", "thumb":
+		return mime != ""
+	}
+	return false
+}
+
 // hashSink accumulates the byte count, the content hash and the leading bytes
 // while the assembled stream passes through (R6/R9).
 type hashSink struct {

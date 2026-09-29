@@ -146,7 +146,7 @@ func scanMessageRows(rows *sql.Rows) ([]MessageRow, error) {
 }
 
 // listMessagesAfter returns messages with seq > afterSeq (ascending), bounded.
-func listMessagesAfter(ctx context.Context, db mysqlx.DBTX, conversationID, afterSeq uint64, limit int) ([]MessageRow, error) {
+func listMessagesAfter(ctx context.Context, db mysqlx.DBTX, conversationID int64, afterSeq uint64, limit int) ([]MessageRow, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT id, conversation_id, conversation_seq, sender_id, sender_type, client_msg_id,
 		       type, payload, status, created_at, expires_at, recalled_at
@@ -160,13 +160,20 @@ func listMessagesAfter(ctx context.Context, db mysqlx.DBTX, conversationID, afte
 }
 
 // listMessagesBefore returns the latest `limit` messages with seq < beforeSeq (descending, reversed).
-func listMessagesBefore(ctx context.Context, db mysqlx.DBTX, conversationID, beforeSeq uint64, limit int) ([]MessageRow, error) {
-	rows, err := db.QueryContext(ctx, `
+// beforeSeq=0 means "no upper bound" — fetch the newest page.
+func listMessagesBefore(ctx context.Context, db mysqlx.DBTX, conversationID int64, beforeSeq uint64, limit int) ([]MessageRow, error) {
+	q := `
 		SELECT id, conversation_id, conversation_seq, sender_id, sender_type, client_msg_id,
 		       type, payload, status, created_at, expires_at, recalled_at
-		FROM messages
-		WHERE conversation_id = ? AND conversation_seq < ?
-		ORDER BY conversation_seq DESC LIMIT ?`, conversationID, beforeSeq, limit)
+		FROM messages WHERE conversation_id = ?`
+	args := []any{conversationID}
+	if beforeSeq != 0 {
+		q += ` AND conversation_seq < ?`
+		args = append(args, beforeSeq)
+	}
+	q += ` ORDER BY conversation_seq DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -397,4 +404,194 @@ func assetsForMessage(ctx context.Context, tx mysqlx.Tx, messageID int64) ([]int
 func deleteAssets(ctx context.Context, tx mysqlx.Tx, messageID int64) error {
 	_, err := tx.ExecContext(ctx, `DELETE FROM message_assets WHERE message_id = ?`, messageID)
 	return err
+}
+
+// ---------------------------------------------------------------------------
+// Read-side helpers for views (A2/A3/A12).
+
+// ReferenceRow is one message_references row.
+type ReferenceRow struct {
+	MessageID   int64
+	RefMsgID    int64
+	RefSenderID int64
+	RefType     string
+	RefDigest   string
+}
+
+// loadReference returns the reference snapshot (if any) for a message.
+func loadReference(ctx context.Context, db mysqlx.DBTX, messageID int64) (ReferenceRow, error) {
+	var r ReferenceRow
+	err := db.QueryRowContext(ctx, `
+		SELECT message_id, ref_message_id, ref_sender_id, ref_type, ref_digest
+		FROM message_references WHERE message_id = ?`, messageID).Scan(
+		&r.MessageID, &r.RefMsgID, &r.RefSenderID, &r.RefType, &r.RefDigest)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ReferenceRow{}, nil
+	}
+	return r, err
+}
+
+// assetRowsForMessage returns all asset rows for one message.
+func assetRowsForMessage(ctx context.Context, db mysqlx.DBTX, messageID int64) ([]AssetRow, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT id, message_id, media_object_id, kind FROM message_assets WHERE message_id = ?`, messageID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AssetRow
+	for rows.Next() {
+		var a AssetRow
+		if err := rows.Scan(&a.ID, &a.MessageID, &a.MediaObjectID, &a.Kind); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// pinnedMessageView is one element of A12.
+type pinnedMessageView struct {
+	MsgID       int64
+	Payload     json.RawMessage
+	MsgType     string
+	Status      string
+	SenderID    int64
+	Seq         uint64
+	CreatedAt   time.Time
+}
+
+// listPinnedMessages loads pinned rows joined to their message bodies.
+func listPinnedMessages(ctx context.Context, db mysqlx.DBTX, conversationID int64) ([]pinnedMessageView, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT m.id, m.payload, m.type, m.status, m.sender_id, m.conversation_seq, m.created_at
+		FROM message_pins p JOIN messages m ON m.id = p.message_id
+		WHERE p.conversation_id = ? ORDER BY p.created_at DESC`, conversationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []pinnedMessageView
+	for rows.Next() {
+		var v pinnedMessageView
+		if err := rows.Scan(&v.MsgID, &v.Payload, &v.MsgType, &v.Status, &v.SenderID, &v.Seq, &v.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
+// conversationMemberID returns the other member of a direct conversation row.
+// The conversations table itself stores only the binary key; the roster lives
+// in conversation_members. We resolve by listing members and picking the one
+// that is not `me`.
+func otherDirectMember(ctx context.Context, db mysqlx.DBTX, conversationID, me int64) (int64, error) {
+	var other int64
+	err := db.QueryRowContext(ctx, `
+		SELECT user_id FROM conversation_members
+		WHERE conversation_id = ? AND user_id <> ? AND left_at IS NULL LIMIT 1`, conversationID, me).Scan(&other)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, apperrors.Unavail("direct partner not found")
+	}
+	return other, err
+}
+
+// transferOwner returns the owner for a transfer conversation (R5).
+func transferOwner(ctx context.Context, db mysqlx.DBTX, conversationID int64) (int64, error) {
+	var id int64
+	err := db.QueryRowContext(ctx, `
+		SELECT transfer_owner_id FROM conversations WHERE id = ? AND type = 'transfer'`, conversationID).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, apperrors.Unavail("transfer conversation not found")
+	}
+	return id, err
+}
+
+// conversationType returns the type column of a conversation.
+func conversationType(ctx context.Context, db mysqlx.DBTX, conversationID int64) (string, error) {
+	var t string
+	err := db.QueryRowContext(ctx, `SELECT type FROM conversations WHERE id = ?`, conversationID).Scan(&t)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", apperrors.Unavail("conversation not found")
+	}
+	return t, err
+}
+
+// lastLiveMessage returns the newest non-expired message in a conversation (R19 digest).
+func lastLiveMessage(ctx context.Context, db mysqlx.DBTX, conversationID int64) (MessageRow, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT id, conversation_id, conversation_seq, sender_id, sender_type, client_msg_id,
+		       type, payload, status, created_at, expires_at, recalled_at
+		FROM messages
+		WHERE conversation_id = ? AND status <> 'expired'
+		ORDER BY conversation_seq DESC LIMIT 1`, conversationID)
+	if err != nil {
+		return MessageRow{}, err
+	}
+	rs, err := scanMessageRows(rows)
+	if err != nil {
+		return MessageRow{}, err
+	}
+	if len(rs) == 0 {
+		return MessageRow{}, nil
+	}
+	return rs[0], nil
+}
+
+// listDirectConversationsForUser returns conversation ids where the user is
+// a current member of a direct/transfer conversation (R19).
+func listDirectConversationsForUser(ctx context.Context, db mysqlx.DBTX, userID int64) ([]int64, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT cm.conversation_id
+		FROM conversation_members cm
+		JOIN conversations c ON c.id = cm.conversation_id
+		WHERE cm.user_id = ? AND cm.left_at IS NULL AND c.type IN ('direct','transfer')`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// loadSettingsBatch loads my settings for a batch of conversations (A3).
+func loadSettingsBatch(ctx context.Context, db mysqlx.DBTX, userID int64, conversationIDs []int64) (map[int64]SettingsRow, error) {
+	out := make(map[int64]SettingsRow, len(conversationIDs))
+	if len(conversationIDs) == 0 {
+		return out, nil
+	}
+	rows, err := db.QueryContext(ctx, `
+		SELECT conversation_id, user_id, pinned, muted, background, last_read_seq, is_marked_unread, unread_anchor_seq, updated_at
+		FROM conversation_settings
+		WHERE user_id = ? AND conversation_id IN (`+mysqlx.Placeholders(len(conversationIDs))+`)`,
+		append([]any{userID}, intsToAny(conversationIDs)...))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var s SettingsRow
+		if err := rows.Scan(&s.ConversationID, &s.UserID, &s.Pinned, &s.Muted, &s.Background,
+			&s.LastReadSeq, &s.IsMarkedUnread, &s.UnreadAnchorSeq, &s.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out[s.ConversationID] = s
+	}
+	return out, rows.Err()
+}
+
+func intsToAny(ids []int64) []any {
+	out := make([]any, len(ids))
+	for i, id := range ids {
+		out[i] = id
+	}
+	return out
 }

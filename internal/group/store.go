@@ -517,6 +517,65 @@ func listMyGroups(ctx context.Context, db mysqlx.DBTX, userID int64) ([]MyGroupV
 	return out, rows.Err()
 }
 
+// findGroupByConversation resolves a group row from its conversation_id (message-side port).
+func findGroupByConversation(ctx context.Context, db mysqlx.DBTX, conversationID int64) (GroupRow, error) {
+	var g GroupRow
+	err := db.QueryRowContext(ctx, `
+		SELECT id, name, owner_id, COALESCE(announcement,''), member_count, status, conversation_id, created_at
+		FROM `+"`groups`"+` WHERE conversation_id = ?`, conversationID).Scan(
+		&g.ID, &g.Name, &g.OwnerID, &g.Announcement, &g.MemberCount, &g.Status, &g.ConversationID, &g.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return GroupRow{}, apperrors.Unavail("group not found for conversation")
+	}
+	if err != nil {
+		return GroupRow{}, fmt.Errorf("group: by conversation: %w", err)
+	}
+	return g, nil
+}
+
+// wasMemberAt reports whether user occupied an active membership interval covering `at` (R15).
+func wasMemberAt(ctx context.Context, db mysqlx.DBTX, groupID, userID int64, at time.Time) (bool, error) {
+	var one int
+	err := db.QueryRowContext(ctx, `
+		SELECT 1 FROM group_members
+		WHERE group_id = ? AND user_id = ? AND joined_at <= ? AND (left_at IS NULL OR left_at > ?)
+		LIMIT 1`, groupID, userID, at, at).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return true, err
+}
+
+// listGroupConversationsForUser returns (conversation_id, group_id, name) for every group
+// the user is currently an active member of (R19).
+func listGroupConversationsForUser(ctx context.Context, db mysqlx.DBTX, userID int64) ([]GroupConvView, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT g.conversation_id, g.id, g.name
+		FROM group_members m
+		JOIN `+"`groups`"+` g ON g.id = m.group_id
+		WHERE m.user_id = ? AND m.left_at IS NULL AND g.status = 'active'`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []GroupConvView
+	for rows.Next() {
+		var v GroupConvView
+		if err := rows.Scan(&v.ConversationID, &v.GroupID, &v.Name); err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
+// GroupConvView is one row of the user's active group conversations.
+type GroupConvView struct {
+	ConversationID int64
+	GroupID        int64
+	Name           string
+}
+
 // TodoView is one row of the todo list/detail responses.
 type TodoView struct {
 	ID          int64       `json:"id"`
