@@ -1,0 +1,48 @@
+# docker-compose for the full stack (MySQL + API). Redis/RabbitMQ/MinIO are
+# optional and left out of the default profile; the API runs with the dev
+# drivers (memory cache, local storage, none MQ) which the contract allows.
+version: "3.9"
+services:
+  mysql:
+    image: mysql:8.0.44
+    environment:
+      MYSQL_ROOT_PASSWORD: root-dev-pw
+      MYSQL_DATABASE: wechat_dev
+      MYSQL_USER: wechat
+      MYSQL_PASSWORD: wechat-dev-pw
+    ports:
+      - "3307:3306"
+    command: >-
+      --character-set-server=utf8mb4 --collation-server=utf8mb4_bin
+      --transaction-isolation=READ-COMMITTED
+      --innodb-lock-wait-timeout=5
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uwechat", "-pwechat-dev-pw"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      WECHAT_MYSQL_DSN: "wechat:wechat-dev-pw@tcp(mysql:3306)/wechat_dev?parseTime=true&transaction_isolation=READ-COMMITTED&timeout=5s"
+      WECHAT_HTTP_ADDR: ":8080"
+      WECHAT_STORAGE_DRIVER: local
+      WECHAT_STORAGE_LOCAL_DIR: /data/objects
+      WECHAT_PUBLIC_BASE_URL: "http://localhost:8080"
+      WECHAT_SIGNING_SECRET: "dev-only-signing-secret-change-me"
+    ports:
+      - "8080:8080"
+    volumes:
+      - objects:/data/objects
+
+volumes:
+  mysql-data:
+  objects:

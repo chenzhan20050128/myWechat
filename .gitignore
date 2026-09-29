@@ -1,0 +1,29 @@
+# IDE
+.idea/
+.vscode/
+
+# Local runtime data
+.tmp/
+data/
+*.log
+
+# Build and test artifacts
+/api
+/migrate
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+coverage.out
+
+# Local secrets and certificates
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# OS metadata
+.DS_Store
+Thumbs.db
