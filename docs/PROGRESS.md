@@ -2,12 +2,12 @@
 
 > 本文件是跨 Agent 会话交接的唯一入口。**每次会话开始先读本文件，结束时必须更新本文件。**
 > 状态口径：`✅` 完成并验证 / `🟡` 代码完成未验证 / `🚧` 进行中 / `❌` 未开始。
-> 最后更新：2026-09-29（会话 5，A3 cmd/api 路由组装 + docker-compose 完成并真机冒烟）
+> 最后更新：2026-09-29（会话 6，B1 group 模块完成：规则/存储/服务/处理器/迁移 00003/集成测试 22 项全绿 + 真机端到端冒烟）
 
 ## ⚠️ 当前状态（2026-09-29）
 
-**阶段一 A3（cmd/api 组装）已完成：真实启动 → register/login/me/media 全链路通，限流按表触发（20/10min 后 429）。**
-下一个任务 **B1=group（SPEC-05）**，按 SPEC-12 §7 它必须先于 message 编码。
+**B1 group（SPEC-05）已完成：R1-R26 全部落地，22 项集成测试 + 8 项规则单测全绿，真实启动验证建群/邀请码入群/禁言/待办生命周期/ADR-005 string id 序列化。**
+下一个任务 **B2=message（SPEC-04，含 WS 网关/180 天保留）**，依赖 B1 的 CanSend/IsModerator 端口。
 开工入口：**docs/specs/12-executor-guide.md**（铁律、任务顺序、代码规范、DoD）。
 
 ## 0. 三十秒恢复上下文
@@ -42,7 +42,7 @@
 | 一 | contact（申请/epoch/单向权限/标签/搜索） | ✅ 02 | ✅ | ✅ 单测 + 真实库集成（A1-A7） | **完成**（27 项测试全绿） |
 | 一 | media（上传会话/分片/对象/下载） | ✅ 03 | ✅ | ✅ 单测 + 真实库集成（A1-A6） | **完成**（25 项测试全绿；user 头像绑定已打通） |
 | 一 | cmd/api 路由组装 + docker-compose | ✅ 00 | ✅ | ✅ 真机冒烟（register/login/me/media + 限流） | **完成** |
-| 二 | group（群/二维码/禁言/待办） | ✅ 05 | ❌ | ❌ | 任务 B1，**必须先于 message 编码** |
+| 二 | group（群/二维码/禁言/待办） | ✅ 05 | ✅ | ✅ 规则单测 8 项 + 真实库集成 22 项 | **完成**（B1，R1-R26 全落地） |
 | 二 | message（含 ws 网关/180 天保留） | ✅ 04 | ❌ | ❌ | 任务 B2，依赖 B1 |
 | 三 | moment（可见快照/互动/定时发布） | ✅ 06 | ❌ | ❌ | 任务 C |
 | 四 | favorite + cleanup（收藏/存储清理） | ✅ 07 | ❌ | ❌ | 任务 D |
@@ -88,6 +88,17 @@ scripts/       check-boundaries.sh ✅（模块边界断言，CI 必跑）
 ```
 
 ## 5. 会话日志（倒序，每次会话追加一段）
+
+### 会话 6 — 2026-09-29（B1 group 模块完成）
+- **迁移 00003_group.sql**：10 张表（`groups`/group_members/group_invite_codes/group_invite_uses/group_mutes/group_events/group_todos/group_todo_assignees/group_todo_member_snapshots/group_todo_events）。关键设计：`group_members.active_flag` 生成列（`IF(left_at IS NULL,1,NULL) STORED`）+ `uk_gmembers_active(group_id,user_id,active_flag)` 让 `INSERT IGNORE` 天然幂等（同一用户重复入群不产生多行）；`member_count` 在 `groups` 行上由锁串行维护（≤500，无 oversell）；invite code 用 10 字符 Crockford Base32（`ids.NewInviteCode`），24h TTL，50 uses 原子 `UPDATE ... WHERE use_count<max_uses`；24h ban-rejoin 窗口；mute `until_at` 为 NULL=永远禁言，canSend 以 DB 时间字段为唯一真值（worker 只做 GC，不依赖）。
+- **`internal/group/` 五件套**：rules.go（纯规则：canSend/muteUntil/resolveAssignees/validateGroupName/Title/Description）/ store.go（全部 SQL，按 ADR-006 锁序 `groups` 行 FOR UPDATE → conversation 行 → messages）/ service.go（R1-R26，端口：`Conversation.CreateGroupTx`、`Friend.GetActiveFriendship`、`SystemMessenger.SendSystemTx`——message 模块 B2 实现）/ handler.go（B1-B23 + GET /users/me/groups，ADR-005 int64 id 全序列化为 string）。
+- **只有真实 MySQL + 真机启动才暴露的 4 个缺陷，按根因修掉（非补丁）**：
+  1. `left_reason VARCHAR(8)` 装不下 `'dissolved'`（9 字符）→ 扩到 VARCHAR(16)。
+  2. Quit 误用 `requireRole(..., ownerOnly=true)` → 普通成员被 FORBIDDEN，应是"任何成员都能退群，群主单独 STATE_CONFLICT"。改用 `requireGroupForWrite` + 自己判断 role。
+  3. Kick/Quit 调了 `waiveAssigneesOnLeave` 但没对受影响 todo 调 `recomputeTodoStatus` → 全员 waived 时 todo 不自动 cancelled（R22 裁决）。循环 affected todo ids 调 recompute。
+  4. HTTP 层 int64 id 直接进 JSON（`user_id:202`）→ 违反 ADR-005。ListMembers/ListTodos/GetTodo/ListMyGroups 全部改为 string 序列化。
+- 验证：规则单测 8 项全绿；集成测试 22 项（T1-T22 覆盖建群/非法名/邀请/幂等/邀请码入群/过期码/kick+ban-window/群主不能退/退群后可再进/转让/解散/升管理员/管理员不能踢管理员/禁言到期自动解禁/管理员不能禁言管理员/解禁/非成员 403/待办完成/全员 waived 自动 cancel/快照可见性/取消待办/我的群列表）全绿；真实启动 E2E 验证（注册 2 用户 → 建群 → 邀请码入群 → 禁言 10m → 建待办 → 完成待办 → 状态自动 completed，所有 id 为 string）。
+- **交接点：下一个任务 B2=message（SPEC-04，WS 网关/180 天保留/系统消息 SendSystemTx 实现）。**
 
 ### 会话 5 — 2026-09-29（A3 cmd/api 组装完成）
 - **新增 `cmd/api/main.go`**：唯一 HTTP 组合根。装配序：config → logger → clock → mysqlx（连接池参数化）→ storage（local/s3 分支）→ 领域 service 按依赖序构造（audit→conversation→device→media→user→contact→auth）→ 标准库 `http.ServeMux`（Go 1.22 路由，**零第三方路由库**——KISS）。

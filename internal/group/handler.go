@@ -155,7 +155,16 @@ func (h *Handler) ListGroupMembers(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, err)
 		return
 	}
-	httpx.JSON(w, r, http.StatusOK, map[string]any{"members": members})
+	out := make([]map[string]any, 0, len(members))
+	for _, m := range members {
+		out = append(out, map[string]any{
+			"user_id":     strconv.FormatInt(m.UserID, 10),
+			"role":        m.Role,
+			"joined_at":   m.JoinedAt.UTC(),
+			"muted_until": m.MutedUntil,
+		})
+	}
+	httpx.JSON(w, r, http.StatusOK, map[string]any{"members": out})
 }
 
 // InviteMembers handles POST /api/v1/groups/{id}/members (B7).
@@ -400,6 +409,38 @@ func (h *Handler) CreateTodo(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, r, http.StatusCreated, map[string]string{"todo_id": strconv.FormatInt(id, 10)})
 }
 
+// todoJSON is the HTTP shape of a todo (int64 ids string-serialized per ADR-005).
+type todoJSON struct {
+	ID          string         `json:"id"`
+	Title       string         `json:"title"`
+	Description string         `json:"description"`
+	DueAt       *time.Time     `json:"due_at,omitempty"`
+	Status      string         `json:"status"`
+	CreatedBy   string         `json:"created_by"`
+	CreatedAt   time.Time      `json:"created_at"`
+	Assignees   []assigneeJSON `json:"assignees"`
+}
+
+type assigneeJSON struct {
+	UserID      string     `json:"user_id"`
+	Status      string     `json:"status"`
+	CompletedAt *time.Time `json:"completed_at,omitempty"`
+}
+
+func todoToJSON(v TodoView) todoJSON {
+	asg := make([]assigneeJSON, 0, len(v.Assignees))
+	for _, a := range v.Assignees {
+		asg = append(asg, assigneeJSON{
+			UserID: strconv.FormatInt(a.UserID, 10), Status: a.Status, CompletedAt: a.CompletedAt,
+		})
+	}
+	return todoJSON{
+		ID: strconv.FormatInt(v.ID, 10), Title: v.Title, Description: v.Description,
+		DueAt: v.DueAt, Status: v.Status, CreatedBy: strconv.FormatInt(v.CreatedBy, 10),
+		CreatedAt: v.CreatedAt.UTC(), Assignees: asg,
+	}
+}
+
 // ListTodos handles GET /api/v1/groups/{id}/todos (B22).
 func (h *Handler) ListTodos(w http.ResponseWriter, r *http.Request) {
 	p, _ := httpx.MustPrincipal(r.Context())
@@ -413,7 +454,11 @@ func (h *Handler) ListTodos(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, err)
 		return
 	}
-	httpx.JSON(w, r, http.StatusOK, map[string]any{"todos": todos})
+	out := make([]todoJSON, 0, len(todos))
+	for _, t := range todos {
+		out = append(out, todoToJSON(t))
+	}
+	httpx.JSON(w, r, http.StatusOK, map[string]any{"todos": out})
 }
 
 // GetTodo handles GET /api/v1/groups/{id}/todos/{tid} (B23).
@@ -429,7 +474,7 @@ func (h *Handler) GetTodo(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, err)
 		return
 	}
-	httpx.JSON(w, r, http.StatusOK, view)
+	httpx.JSON(w, r, http.StatusOK, todoToJSON(*view))
 }
 
 // CompleteTodo handles POST /api/v1/groups/{id}/todos/{tid}/complete (B20).
@@ -470,7 +515,16 @@ func (h *Handler) ListMyGroups(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, err)
 		return
 	}
-	httpx.JSON(w, r, http.StatusOK, map[string]any{"groups": groups})
+	out := make([]map[string]any, 0, len(groups))
+	for _, g := range groups {
+		out = append(out, map[string]any{
+			"group_id":     strconv.FormatInt(g.GroupID, 10),
+			"name":         g.Name,
+			"role":         g.Role,
+			"member_count": g.MemberCount,
+		})
+	}
+	httpx.JSON(w, r, http.StatusOK, map[string]any{"groups": out})
 }
 
 // groupViewRow is the JSON shape for GET /groups/{id}.

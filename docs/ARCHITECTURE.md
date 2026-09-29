@@ -47,7 +47,7 @@
 
 - **隔离级别**：`READ COMMITTED`（合同 §12.4），会话级设置在 DSN。
 - **事务边界**：Service 层用 `mysqlx.WithinTx(ctx, func(tx) error)`；Store 方法全部接受 `tx` 参数。业务数据 + outbox_events 必须同事务提交。
-- **锁顺序**（防死锁，全局统一）：users(按 id 升序) → friendships/friend_settings(user_low,user_high 升序) → conversations → conversation_members → 业务表。死锁/锁超时以同幂等键最多重试 3 次（合同 §12.4）。
+- **锁顺序**（防死锁，全局统一）：users(按 id 升序) → friendships/friend_settings(user_low,user_high 升序) → conversations → conversation_members → 业务表。**群内写路径**（group 模块）：先锁 `` `groups` `` 行 `FOR UPDATE`，再写 group_members/group_events/系统消息（其下再走 conversation → messages），最后 outbox。死锁/锁超时以同幂等键最多重试 3 次（合同 §12.4）。
 - **会话序号**：`conversation_seq` 通过 `SELECT ... FOR UPDATE` 锁会话行递增 `last_seq` 分配（合同 §12.4），禁止 AUTO_INCREMENT。
 - **SKIP LOCKED** 仅用于 Worker 任务竞争，不用于用户读路径（合同 §14.5）。
 
