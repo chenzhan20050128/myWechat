@@ -6,19 +6,28 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
 // Config is the root configuration for all three processes (api/gateway/worker).
 type Config struct {
-	HTTP    HTTP
-	MySQL   MySQL
-	Cache   Cache
-	Storage Storage
-	MQ      MQ
-	Auth    Auth
-	Secret  Secret
-	Log     Log
+	HTTP     HTTP
+	MySQL    MySQL
+	Cache    Cache
+	Storage  Storage
+	MQ       MQ
+	Auth     Auth
+	Secret   Secret
+	Log      Log
+	Operator Operator
+}
+
+// Operator holds the phase-6 operator whitelist (SPEC-09 R1). Before the
+// operator domain lands, IsOperator is decided solely by this config list.
+type Operator struct {
+	// IDs is the parsed set of user IDs allowed to administer content accounts.
+	IDs map[int64]bool
 }
 
 // Secret holds the HMAC keys for platform-signed tokens (SPEC-00 §2.6/§2.9).
@@ -137,6 +146,9 @@ func Load() (*Config, error) {
 			Level:  env("WECHAT_LOG_LEVEL", "info"),
 			Format: env("WECHAT_LOG_FORMAT", "json"),
 		},
+		Operator: Operator{
+			IDs: parseIDList(env("WECHAT_OPERATOR_IDS", "")),
+		},
 	}
 	if err := c.validate(); err != nil {
 		return nil, err
@@ -170,6 +182,17 @@ func (c *Config) validate() error {
 		return fmt.Errorf("config: s3 driver requires WECHAT_S3_ENDPOINT and WECHAT_S3_BUCKET")
 	}
 	return nil
+}
+
+func parseIDList(s string) map[int64]bool {
+	out := map[int64]bool{}
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if n, err := strconv.ParseInt(part, 10, 64); err == nil && n > 0 {
+			out[n] = true
+		}
+	}
+	return out
 }
 
 func env(key, def string) string {

@@ -2,7 +2,7 @@
 
 > 本文件是跨 Agent 会话交接的唯一入口。**每次会话开始先读本文件，结束时必须更新本文件。**
 > 状态口径：`✅` 完成并验证 / `🟡` 代码完成未验证 / `🚧` 进行中 / `❌` 未开始。
-> 最后更新：2026-09-29（会话 6，B1 group 模块完成：规则/存储/服务/处理器/迁移 00003/集成测试 22 项全绿 + 真机端到端冒烟）
+> 最后更新：2026-09-29（会话 12，G runtime+operator 完成：outbox relay lease/publish/confirm + inbox 去重/重试阶梯/死信 + reports/reports resolve/queue stats/dead-letter replay；迁移 00009；runtime 7 项、operator 4 项集成测试全绿；下一个任务 H=acceptance matrix）
 
 ## ⚠️ 当前状态（2026-09-29）
 
@@ -44,12 +44,12 @@
 | 一 | cmd/api 路由组装 + docker-compose | ✅ 00 | ✅ | ✅ 真机冒烟（register/login/me/media + 限流） | **完成** |
 | 二 | group（群/二维码/禁言/待办） | ✅ 05 | ✅ | ✅ 规则单测 8 项 + 真实库集成 22 项 | **完成**（B1，R1-R26 全落地） |
 | 二 | message（HTTP 路径 + 180 天保留 worker；WS 网关留 G） | ✅ 04 | ✅ | ✅ 集成 10 项 | **主体完成**；WS 网关在任务 G 随 runtime 落地 |
-| 三 | moment（可见快照/互动/定时发布） | ✅ 06 | ❌ | ❌ | 任务 C |
-| 四 | favorite + cleanup（收藏/存储清理） | ✅ 07 | ❌ | ❌ | 任务 D |
-| 五 | backup（备份/恢复/设备迁移） | ✅ 08 | ❌ | ❌ | 任务 E |
-| 六 | content（公众号/文章/菜单/客服/通知） | ✅ 09 | ❌ | ❌ | 任务 F |
-| 贯穿 | runtime（Relay/Inbox/重试/Scheduler/Worker/指标） | ✅ 10 | ❌ | ❌ | 任务 G（B2 后可并行） |
-| 六~七 | operator（审计/举报处置/报表/验收矩阵） | ✅ 11 | ❌ | ❌ | 任务 G+H |
+| 三 | moment（可见快照/互动/定时发布） | ✅ 06 | ✅ | ✅ 集成 21 项 | **完成**（C，R1-R17 + worker PublishDueSchedules/RecoverStaleLeases） |
+| 四 | favorite + cleanup（收藏/存储清理） | ✅ 07 | ✅ | ✅ 集成 10 项 | **完成**（D，R1-R9 收藏 + 三段式清理预览/确认；GC 队列表已建） |
+| 五 | backup（备份/恢复/设备迁移） | ✅ 08 | ✅ | ✅ 集成 8 项 | **完成**（E，单槽位/30 天过期/恢复档案只读/设备迁移握手） |
+| 六 | content（公众号/文章/菜单/客服/通知） | ✅ 09 | ✅ | ✅ 集成 16 项 | **完成**（F，R1-R19；operator 端口走 WECHAT_OPERATOR_IDS 白名单；FanoutArticleNotifications 3/天上限） |
+| 贯穿 | runtime（Relay/Inbox/重试/Scheduler/Worker/指标） | ✅ 10 | ✅ | ✅ 集成 7 项 | **完成**（outbox lease/publish/confirm、inbox dedupe+retry ladder、dead letters、lifecycle runner；RabbitMQ 适配器留部署期） |
+| 六~七 | operator（审计/举报处置/报表/验收矩阵） | ✅ 11 | ✅ | ✅ 集成 4 项 | **完成**（reports 幂等合并、resolve、queue stats、dead-letter replay；FreezeUser/ContentModeration 端口留部署期） |
 | — | 执行者指南（必读） | ✅ 12 | — | — | 执行者开工入口 |
 
 ## 3. 已知事项 / 待办（按优先级）

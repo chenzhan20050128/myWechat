@@ -8,9 +8,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 MODULE="github.com/example/wechat"
-DOMAINS=(auth user device contact conversation media group message ws audit)
-# future phases: message group group_todo moment moment_schedule favorite
-#   storage_cleanup backup content_account service_session notification operator
+DOMAINS=(auth user device contact conversation media group message moment favorite backup content runtime operator ws audit)
+# future phases: content_account service_session notification operator
 
 fail=0
 

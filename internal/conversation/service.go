@@ -97,6 +97,27 @@ func (s *Service) CreateGroupTx(ctx context.Context, tx mysqlx.Tx, creatorID int
 	return id, nil
 }
 
+// CreateOfficialServiceTx creates a type='official_service' conversation with
+// the user as a member. The staff side is linked via service_session_staff at
+// read time, so only the user is recorded as a conversation_members row here
+// (SPEC-09 R10).
+func (s *Service) CreateOfficialServiceTx(ctx context.Context, tx mysqlx.Tx, userID int64) (int64, error) {
+	now := s.now.Now()
+	res, err := tx.ExecContext(ctx,
+		`INSERT INTO conversations (type, created_at) VALUES ('official_service', ?)`, now)
+	if err != nil {
+		return 0, fmt.Errorf("conversation: create official_service: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("conversation: official_service last id: %w", err)
+	}
+	if err := s.addMemberTx(ctx, tx, id, userID, now); err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
 // IsMember reports whether user is a current member (left_at IS NULL) of the
 // conversation (R33).
 func (s *Service) IsMember(ctx context.Context, conversationID, userID int64) (bool, error) {

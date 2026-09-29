@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
 	"net/http"
@@ -19,11 +20,16 @@ import (
 	"github.com/example/wechat/internal/audit"
 	"github.com/example/wechat/internal/auth"
 	"github.com/example/wechat/internal/contact"
+	"github.com/example/wechat/internal/content"
 	"github.com/example/wechat/internal/conversation"
 	"github.com/example/wechat/internal/device"
 	"github.com/example/wechat/internal/group"
+	"github.com/example/wechat/internal/backup"
+	"github.com/example/wechat/internal/favorite"
 	"github.com/example/wechat/internal/media"
 	"github.com/example/wechat/internal/message"
+	"github.com/example/wechat/internal/moment"
+	"github.com/example/wechat/internal/operator"
 	"github.com/example/wechat/internal/platform/cache"
 	"github.com/example/wechat/internal/platform/clock"
 	"github.com/example/wechat/internal/platform/config"
@@ -95,6 +101,11 @@ func main() {
 	groups := group.New(db, convs, contacts, nil, clk.Now)
 	messages := message.New(db, contacts, groupMessageAdapter{g: groups}, mediaSvc, convs, clk.Now)
 	groups.SetMessenger(messages)
+	moments := moment.New(db, contactMomentAdapter{c: contacts}, mediaSvc, nil, clk.Now)
+	favorites := favorite.New(db, mediaSvc, nil, clk.Now)
+	backups := backup.New(db, backupSourcesStub{}, clk.Now)
+	contentSvc := content.New(db, operatorWhitelist{ids: cfg.Operator.IDs}, convs, nil, clk.Now)
+	operatorSvc := operator.New(db, operatorWhitelist{ids: cfg.Operator.IDs}, clk.Now)
 
 	// Rate limits (SPEC-12 §7 default table, fail-open).
 	authLimiter := ratelimit.New(cacheStore, "auth", 20, 10*time.Minute)
@@ -104,7 +115,8 @@ func main() {
 
 	mux := buildRouter(routerServices{
 		auth: authSvc, devices: devices, users: users, contacts: contacts,
-		groups: groups, media: mediaSvc, messages: messages,
+		groups: groups, media: mediaSvc, messages: messages, moments: moments, favorites: favorites,
+		backups: backups, content: contentSvc, operator: operatorSvc,
 		authn: authSvc,
 		limiters: limiters{auth: authLimiter, write: writeLimiter, chunk: chunkLimiter, read: readLimiter},
 	})
@@ -147,6 +159,11 @@ type routerServices struct {
 	groups   *group.Service
 	media    *media.Service
 	messages *message.Service
+	moments  *moment.Service
+	favorites *favorite.Service
+	backups  *backup.Service
+	content  *content.Service
+	operator *operator.Service
 	authn    httpx.Authenticator
 	limiters limiters
 }
@@ -192,6 +209,71 @@ func (a groupMessageAdapter) ListGroupConversationsForUser(ctx context.Context, 
 	return out, nil
 }
 
+// backupSourcesStub is a placeholder Sources implementation until the
+// runtime module wires real domain exporters (SPEC-10). It returns empty
+// JSON objects for every section so the backup lifecycle can be exercised
+// end-to-end against the schema.
+type backupSourcesStub struct{}
+
+func (backupSourcesStub) Profile(_ context.Context, _ int64) (json.RawMessage, error) {
+	return json.RawMessage(`{}`), nil
+}
+func (backupSourcesStub) ContactSettings(_ context.Context, _ int64) (json.RawMessage, error) {
+	return json.RawMessage(`{}`), nil
+}
+func (backupSourcesStub) Favorites(_ context.Context, _ int64) (json.RawMessage, error) {
+	return json.RawMessage(`{}`), nil
+}
+func (backupSourcesStub) OwnMoments(_ context.Context, _ int64) (json.RawMessage, error) {
+	return json.RawMessage(`{}`), nil
+}
+func (backupSourcesStub) ReadableMessages(_ context.Context, _ int64) (json.RawMessage, error) {
+	return json.RawMessage(`[]`), nil
+}
+
+// operatorWhitelist is the phase-6 Operator port: until the operator domain
+// lands, content-account administration is decided by WECHAT_OPERATOR_IDS.
+type operatorWhitelist struct{ ids map[int64]bool }
+
+func (w operatorWhitelist) IsOperator(_ context.Context, userID int64) bool {
+	return w.ids[userID]
+}
+
+// contactMomentAdapter adapts *contact.Service to the moment.Contact port.
+type contactMomentAdapter struct{ c *contact.Service }
+
+func (a contactMomentAdapter) ActiveFriendsWithEpoch(ctx context.Context, authorID int64) ([]moment.FriendEpoch, error) {
+	rows, err := a.c.ActiveFriendsWithEpoch(ctx, authorID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]moment.FriendEpoch, len(rows))
+	for i, r := range rows {
+		out[i] = moment.FriendEpoch{UserID: r.UserID, Epoch: r.Epoch}
+	}
+	return out, nil
+}
+
+func (a contactMomentAdapter) IsFriendCurrentEpoch(ctx context.Context, authorID, viewerID, epoch int64) (bool, error) {
+	return a.c.IsFriendCurrentEpoch(ctx, authorID, viewerID, epoch)
+}
+
+func (a contactMomentAdapter) MomentPerm(ctx context.Context, authorID, viewerID int64) (bool, bool, bool, error) {
+	return a.c.MomentPerm(ctx, authorID, viewerID)
+}
+
+func (a contactMomentAdapter) ExpandTag(ctx context.Context, ownerID, tagID int64) ([]moment.FriendEpoch, error) {
+	rows, err := a.c.ExpandTag(ctx, ownerID, tagID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]moment.FriendEpoch, len(rows))
+	for i, r := range rows {
+		out[i] = moment.FriendEpoch{UserID: r.UserID, Epoch: r.Epoch}
+	}
+	return out, nil
+}
+
 // limit wraps a handler with a named limiter. The subject is the authenticated
 // user id when present, otherwise the client IP — so the same middleware works
 // for public (login) and authed routes alike (SPEC-12 §7 rate table).
@@ -231,6 +313,11 @@ func buildRouter(s routerServices) http.Handler {
 	groupH := group.NewHandler(s.groups)
 	mediaH := media.NewHandler(s.media)
 	messageH := message.NewHandler(s.messages)
+	momentH := moment.NewHandler(s.moments)
+	favoriteH := favorite.NewHandler(s.favorites)
+	backupH := backup.NewHandler(s.backups)
+	contentH := content.NewHandler(s.content)
+	operatorH := operator.NewHandler(s.operator)
 	deviceH := device.NewHandler(s.devices)
 
 	mux := http.NewServeMux()
@@ -305,6 +392,21 @@ func buildRouter(s routerServices) http.Handler {
 
 	// Messages (SPEC-04 §5).
 	message.Mount(mux, messageH, authed)
+
+	// Moments (SPEC-06 §8).
+	moment.Mount(mux, momentH, authed, read)
+
+	// Favorites + storage cleanup (SPEC-07).
+	favorite.Mount(mux, favoriteH, authed, read)
+
+	// Backups + device migration (SPEC-08).
+	backup.Mount(mux, backupH, authed, read)
+
+	// Content accounts (SPEC-09).
+	content.Mount(mux, contentH, authed, read)
+
+	// Operator / reports / admin stats (SPEC-11).
+	operator.Mount(mux, operatorH, authed, read)
 
 	// Media (SPEC-03 §4).
 	mux.Handle("POST /api/v1/media/uploads", authed(mediaH.CreateUpload))

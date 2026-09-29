@@ -457,6 +457,64 @@ func (s *Service) ExpireStaleRequests(ctx context.Context) (int64, error) {
 	return expireStaleRequests(ctx, s.db, now.Add(-RequestTTL), now)
 }
 
+// FriendEpoch is one (user_id, current friendship_epoch) pair for snapshot.
+type FriendEpoch struct {
+	UserID int64
+	Epoch  int64
+}
+
+// ActiveFriendsWithEpoch returns author's current active friends with their
+// epoch (SPEC-06 §2, moment port).
+func (s *Service) ActiveFriendsWithEpoch(ctx context.Context, authorID int64) ([]FriendEpoch, error) {
+	return listActiveFriendEpochs(ctx, s.db, authorID)
+}
+
+// IsFriendCurrentEpoch reports whether viewer is currently friends with author
+// and the live epoch matches `epoch` (snapshot vs. realtime).
+func (s *Service) IsFriendCurrentEpoch(ctx context.Context, authorID, viewerID, epoch int64) (bool, error) {
+	live, ok, err := s.GetActiveFriendship(ctx, authorID, viewerID)
+	if err != nil || !ok {
+		return false, err
+	}
+	return live == epoch, nil
+}
+
+// MomentPerm returns author's live restrictions against viewer (hidden/blocked/
+// no_moments). Mapping from friend_settings.moment_perm (visible/hidden) and
+// message_perm (normal/no_message/blocked).
+func (s *Service) MomentPerm(ctx context.Context, authorID, viewerID int64) (hidden, blocked, noMoments bool, err error) {
+	mine, err := loadSettings(ctx, s.db, authorID, []int64{viewerID})
+	if err != nil {
+		return false, false, false, err
+	}
+	st := settingsOf(mine, viewerID)
+	if st.MomentPerm == "hidden" {
+		hidden = true
+	}
+	switch st.MessagePerm {
+	case "blocked":
+		blocked = true
+	case "no_message":
+		noMoments = true
+	}
+	return hidden, blocked, noMoments, nil
+}
+
+// ExpandTag returns (user_id, epoch) snapshot for a tag (SPEC-06 §2).
+func (s *Service) ExpandTag(ctx context.Context, ownerID, tagID int64) ([]FriendEpoch, error) {
+	return listTagMemberEpochs(ctx, s.db, ownerID, tagID)
+}
+
+// IsMuted reports viewer's moment_notify=false against author (mute_author).
+func (s *Service) IsMuted(ctx context.Context, viewerID, authorID int64) (bool, error) {
+	mine, err := loadSettings(ctx, s.db, viewerID, []int64{authorID})
+	if err != nil {
+		return false, err
+	}
+	st := settingsOf(mine, authorID)
+	return !st.MomentNotify, nil
+}
+
 // IssueQRCode signs the caller's personal QR token (R1).
 func (s *Service) IssueQRCode(ctx context.Context, userID int64) (string, time.Time, error) {
 	return encodeQR(s.qr, userID, s.now.Now())

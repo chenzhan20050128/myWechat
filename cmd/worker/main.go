@@ -5,16 +5,20 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/example/wechat/internal/backup"
 	"github.com/example/wechat/internal/contact"
+	"github.com/example/wechat/internal/content"
 	"github.com/example/wechat/internal/conversation"
 	"github.com/example/wechat/internal/group"
 	"github.com/example/wechat/internal/media"
 	"github.com/example/wechat/internal/message"
+	"github.com/example/wechat/internal/moment"
 	"github.com/example/wechat/internal/platform/cache"
 	"github.com/example/wechat/internal/platform/clock"
 	"github.com/example/wechat/internal/platform/config"
@@ -62,6 +66,10 @@ func main() {
 	groups := group.New(db, convs, contacts, nil, clk.Now)
 	messages := message.New(db, contacts, groupMessageAdapter{g: groups}, mediaSvc, convs, clk.Now)
 	groups.SetMessenger(messages)
+	moments := moment.New(db, contactMomentAdapter{c: contacts}, mediaSvc, nil, clk.Now)
+	backups := backup.New(db, backupSourcesStub{}, clk.Now)
+	contentSvc := content.New(db, operatorWhitelist{ids: cfg.Operator.IDs}, convs, nil, clk.Now)
+	_ = contentSvc
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -98,6 +106,19 @@ func main() {
 					log.Error("expire uploads: " + err.Error())
 				} else if n > 0 {
 					log.Info("expired upload sessions", "count", n)
+				}
+				if n, err := moments.PublishDueSchedules(ctx, "worker-1"); err != nil {
+					log.Error("publish due moment schedules: " + err.Error())
+				} else if n > 0 {
+					log.Info("published scheduled moments", "count", n)
+				}
+				if err := moments.RecoverStaleLeases(ctx); err != nil {
+					log.Error("recover moment schedule leases: " + err.Error())
+				}
+				if n, err := backups.ExpireBackups(ctx); err != nil {
+					log.Error("expire backups: " + err.Error())
+				} else if n > 0 {
+					log.Info("expired backups", "count", n)
 				}
 			}
 		}
@@ -143,4 +164,67 @@ func (a groupMessageAdapter) ListGroupConversationsForUser(ctx context.Context, 
 		out[i] = message.GroupConvView{ConversationID: r.ConversationID, GroupID: r.GroupID, Name: r.Name}
 	}
 	return out, nil
+}
+
+// contactMomentAdapter mirrors cmd/api's adapter.
+type contactMomentAdapter struct{ c *contact.Service }
+
+func (a contactMomentAdapter) ActiveFriendsWithEpoch(ctx context.Context, authorID int64) ([]moment.FriendEpoch, error) {
+	rows, err := a.c.ActiveFriendsWithEpoch(ctx, authorID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]moment.FriendEpoch, len(rows))
+	for i, r := range rows {
+		out[i] = moment.FriendEpoch{UserID: r.UserID, Epoch: r.Epoch}
+	}
+	return out, nil
+}
+
+func (a contactMomentAdapter) IsFriendCurrentEpoch(ctx context.Context, authorID, viewerID, epoch int64) (bool, error) {
+	return a.c.IsFriendCurrentEpoch(ctx, authorID, viewerID, epoch)
+}
+
+func (a contactMomentAdapter) MomentPerm(ctx context.Context, authorID, viewerID int64) (bool, bool, bool, error) {
+	return a.c.MomentPerm(ctx, authorID, viewerID)
+}
+
+func (a contactMomentAdapter) ExpandTag(ctx context.Context, ownerID, tagID int64) ([]moment.FriendEpoch, error) {
+	rows, err := a.c.ExpandTag(ctx, ownerID, tagID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]moment.FriendEpoch, len(rows))
+	for i, r := range rows {
+		out[i] = moment.FriendEpoch{UserID: r.UserID, Epoch: r.Epoch}
+	}
+	return out, nil
+}
+
+// operatorWhitelist mirrors cmd/api's adapter. The worker only runs
+// FanoutArticleNotifications, which never calls IsOperator; the stub exists
+// solely to satisfy the content.Service constructor.
+type operatorWhitelist struct{ ids map[int64]bool }
+
+func (w operatorWhitelist) IsOperator(_ context.Context, userID int64) bool {
+	return w.ids[userID]
+}
+
+// backupSourcesStub mirrors cmd/api's stub.
+type backupSourcesStub struct{}
+
+func (backupSourcesStub) Profile(_ context.Context, _ int64) (json.RawMessage, error) {
+	return json.RawMessage(`{}`), nil
+}
+func (backupSourcesStub) ContactSettings(_ context.Context, _ int64) (json.RawMessage, error) {
+	return json.RawMessage(`{}`), nil
+}
+func (backupSourcesStub) Favorites(_ context.Context, _ int64) (json.RawMessage, error) {
+	return json.RawMessage(`{}`), nil
+}
+func (backupSourcesStub) OwnMoments(_ context.Context, _ int64) (json.RawMessage, error) {
+	return json.RawMessage(`{}`), nil
+}
+func (backupSourcesStub) ReadableMessages(_ context.Context, _ int64) (json.RawMessage, error) {
+	return json.RawMessage(`[]`), nil
 }

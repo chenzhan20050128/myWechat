@@ -214,6 +214,76 @@ func listActiveFriendIDs(ctx context.Context, db mysqlx.DBTX, owner, afterID int
 	return ids, nil
 }
 
+// listActiveFriendEpochs returns (friend_id, current_epoch) for every active
+// friendship of owner (moment snapshot port, SPEC-06 §2).
+func listActiveFriendEpochs(ctx context.Context, db mysqlx.DBTX, owner int64) ([]FriendEpoch, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT friend_id, epoch FROM (
+		  SELECT f.user_high AS friend_id, f.friendship_epoch AS epoch
+		  FROM friendships f JOIN friendship_epochs e
+		    ON e.user_low = f.user_low AND e.user_high = f.user_high
+		   AND e.current_epoch = f.friendship_epoch
+		  WHERE f.user_low = ? AND f.status = 'active'
+		  UNION ALL
+		  SELECT f.user_low AS friend_id, f.friendship_epoch AS epoch
+		  FROM friendships f JOIN friendship_epochs e
+		    ON e.user_low = f.user_low AND e.user_high = f.user_high
+		   AND e.current_epoch = f.friendship_epoch
+		  WHERE f.user_high = ? AND f.status = 'active'
+		) t ORDER BY friend_id ASC`, owner, owner)
+	if err != nil {
+		return nil, fmt.Errorf("contact: friend epochs: %w", err)
+	}
+	defer rows.Close()
+	var out []FriendEpoch
+	for rows.Next() {
+		var v FriendEpoch
+		if err := rows.Scan(&v.UserID, &v.Epoch); err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
+// listTagMemberEpochs expands a tag to (friend_id, epoch) snapshot (moment port).
+func listTagMemberEpochs(ctx context.Context, db mysqlx.DBTX, ownerID, tagID int64) ([]FriendEpoch, error) {
+	var one int
+	if err := db.QueryRowContext(ctx, `SELECT 1 FROM contact_tags WHERE id = ? AND owner_id = ?`, tagID, ownerID).Scan(&one); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, apperrors.Unavail("tag not found")
+		}
+		return nil, err
+	}
+	rows, err := db.QueryContext(ctx, `
+		SELECT friend_id, epoch FROM (
+		  SELECT cm.friend_id, f.friendship_epoch AS epoch
+		  FROM contact_tag_members cm
+		  JOIN friendships f ON f.user_low = ? AND f.user_high = cm.friend_id AND f.status = 'active'
+		  JOIN friendship_epochs e ON e.user_low = f.user_low AND e.user_high = f.user_high AND e.current_epoch = f.friendship_epoch
+		  WHERE cm.tag_id = ?
+		  UNION ALL
+		  SELECT cm.friend_id, f.friendship_epoch AS epoch
+		  FROM contact_tag_members cm
+		  JOIN friendships f ON f.user_high = ? AND f.user_low = cm.friend_id AND f.status = 'active'
+		  JOIN friendship_epochs e ON e.user_low = f.user_low AND e.user_high = f.user_high AND e.current_epoch = f.friendship_epoch
+		  WHERE cm.tag_id = ?
+		) t`, ownerID, tagID, ownerID, tagID)
+	if err != nil {
+		return nil, fmt.Errorf("contact: tag epochs: %w", err)
+	}
+	defer rows.Close()
+	var out []FriendEpoch
+	for rows.Next() {
+		var v FriendEpoch
+		if err := rows.Scan(&v.UserID, &v.Epoch); err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
 // ---------------------------------------------------------------------------
 // Friend settings (R15-R19).
 
