@@ -13,6 +13,7 @@ import (
 // Media is the consumer-defined port over media.
 type Media interface {
 	OnReferencesRemoved(ctx context.Context, objectIDs []int64) error
+	EnqueueGCTx(ctx context.Context, tx mysqlx.Tx, objectIDs []int64, purgeAfter time.Time) error
 }
 
 // MessageReader is the consumer-defined port over message.
@@ -266,7 +267,8 @@ func (s *Service) Confirm(ctx context.Context, userID, jobID int64) (int, int, e
 				return err
 			}
 			if remaining == 0 {
-				if err := enqueueGC(ctx, tx, it.MediaObjectID, now); err != nil {
+				purgeAfter := now.AddDate(0, 0, GCRetentionDays)
+				if err := s.media.EnqueueGCTx(ctx, tx, []int64{it.MediaObjectID}, purgeAfter); err != nil {
 					return err
 				}
 			}

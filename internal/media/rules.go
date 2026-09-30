@@ -26,11 +26,15 @@ const (
 
 // Session statuses (R2/R6/R7).
 const (
-	SessionOpen      = "open"
-	SessionCompleted = "completed"
-	SessionAborted   = "aborted"
-	SessionExpired   = "expired"
+	SessionOpen       = "open"
+	SessionAssembling = "assembling"
+	SessionCompleted  = "completed"
+	SessionAborted    = "aborted"
+	SessionExpired    = "expired"
 )
+
+// AssemblyLeaseTTL bounds a server-side chunk assembly attempt.
+const AssemblyLeaseTTL = 5 * time.Minute
 
 // Object statuses (R10).
 const (
@@ -63,15 +67,15 @@ const (
 
 // allowedMIMEs is the R8 whitelist, mapped to canonical file extensions.
 var allowedMIMEs = map[string]string{
-	"image/jpeg":                "jpg",
-	"image/png":                 "png",
-	"image/webp":                "webp",
-	"image/gif":                 "gif",
-	"video/mp4":                 "mp4",
-	"audio/mpeg":                "mp3",
-	"audio/aac":                 "aac",
-	"audio/amr":                 "amr",
-	"application/octet-stream":  "bin",
+	"image/jpeg":               "jpg",
+	"image/png":                "png",
+	"image/webp":               "webp",
+	"image/gif":                "gif",
+	"video/mp4":                "mp4",
+	"audio/mpeg":               "mp3",
+	"audio/aac":                "aac",
+	"audio/amr":                "amr",
+	"application/octet-stream": "bin",
 }
 
 // avatarMIMEs is the SPEC-01 R27 subset.

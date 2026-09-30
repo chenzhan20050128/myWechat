@@ -14,23 +14,23 @@ import (
 
 // GroupRow is a `groups` row (R1).
 type GroupRow struct {
-	ID         int64
-	Name       string
-	OwnerID    int64
-	Announcement string
-	MemberCount int
-	Status     string
+	ID             int64
+	Name           string
+	OwnerID        int64
+	Announcement   string
+	MemberCount    int
+	Status         string
 	ConversationID int64
-	CreatedAt  time.Time
+	CreatedAt      time.Time
 }
 
 // MemberRow is a group_members row joined with its role.
 type MemberRow struct {
-	ID       int64
-	GroupID  int64
-	UserID   int64
-	Role     string
-	JoinedAt time.Time
+	ID         int64
+	GroupID    int64
+	UserID     int64
+	Role       string
+	JoinedAt   time.Time
 	MutedUntil *time.Time
 }
 
@@ -454,9 +454,9 @@ func insertTodoEvent(ctx context.Context, tx mysqlx.Tx, todoID int64, event stri
 
 // MemberView is one row of GET /groups/{id}/members.
 type MemberView struct {
-	UserID     int64   `json:"user_id"`
-	Role       string  `json:"role"`
-	JoinedAt   time.Time `json:"joined_at"`
+	UserID     int64      `json:"user_id"`
+	Role       string     `json:"role"`
+	JoinedAt   time.Time  `json:"joined_at"`
 	MutedUntil *time.Time `json:"muted_until,omitempty"`
 }
 
@@ -489,10 +489,10 @@ func listActiveMembers(ctx context.Context, db mysqlx.DBTX, groupID int64) ([]Me
 
 // MyGroupView is one row of GET /users/me/groups.
 type MyGroupView struct {
-	GroupID   int64     `json:"group_id"`
-	Name      string    `json:"name"`
-	Role      string    `json:"role"`
-	MemberCount int     `json:"member_count"`
+	GroupID     int64  `json:"group_id"`
+	Name        string `json:"name"`
+	Role        string `json:"role"`
+	MemberCount int    `json:"member_count"`
 }
 
 func listMyGroups(ctx context.Context, db mysqlx.DBTX, userID int64) ([]MyGroupView, error) {
@@ -546,6 +546,47 @@ func wasMemberAt(ctx context.Context, db mysqlx.DBTX, groupID, userID int64, at 
 	return true, err
 }
 
+func wasMemberAtMany(ctx context.Context, db mysqlx.DBTX, groupID, userID int64, ats []time.Time) ([]bool, error) {
+	if len(ats) == 0 {
+		return nil, nil
+	}
+	rows, err := db.QueryContext(ctx, `
+		SELECT joined_at, left_at FROM group_members
+		WHERE group_id = ? AND user_id = ?`, groupID, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var intervals [][2]time.Time
+	for rows.Next() {
+		var joined, left sql.NullTime
+		if err := rows.Scan(&joined, &left); err != nil {
+			return nil, err
+		}
+		if !joined.Valid {
+			continue
+		}
+		end := time.Time{}
+		if left.Valid {
+			end = left.Time
+		}
+		intervals = append(intervals, [2]time.Time{joined.Time, end})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	out := make([]bool, len(ats))
+	for i, at := range ats {
+		for _, interval := range intervals {
+			if !at.Before(interval[0]) && (interval[1].IsZero() || at.Before(interval[1])) {
+				out[i] = true
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
 // listGroupConversationsForUser returns (conversation_id, group_id, name) for every group
 // the user is currently an active member of (R19).
 func listGroupConversationsForUser(ctx context.Context, db mysqlx.DBTX, userID int64) ([]GroupConvView, error) {
@@ -578,13 +619,13 @@ type GroupConvView struct {
 
 // TodoView is one row of the todo list/detail responses.
 type TodoView struct {
-	ID          int64       `json:"id"`
-	Title       string      `json:"title"`
-	Description string      `json:"description"`
-	DueAt       *time.Time  `json:"due_at,omitempty"`
-	Status      string      `json:"status"`
-	CreatedBy   int64       `json:"created_by"`
-	CreatedAt   time.Time   `json:"created_at"`
+	ID          int64          `json:"id"`
+	Title       string         `json:"title"`
+	Description string         `json:"description"`
+	DueAt       *time.Time     `json:"due_at,omitempty"`
+	Status      string         `json:"status"`
+	CreatedBy   int64          `json:"created_by"`
+	CreatedAt   time.Time      `json:"created_at"`
 	Assignees   []AssigneeView `json:"assignees"`
 }
 

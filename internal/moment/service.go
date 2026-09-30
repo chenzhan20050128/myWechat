@@ -8,6 +8,7 @@ import (
 	"time"
 
 	apperrors "github.com/example/wechat/internal/platform/errors"
+	"github.com/example/wechat/internal/platform/mq"
 	"github.com/example/wechat/internal/platform/mysqlx"
 )
 
@@ -29,6 +30,7 @@ type Contact interface {
 // Media asserts uploaded assets are ready before publication.
 type Media interface {
 	AssertReady(ctx context.Context, ownerID, objectID int64, kind string) error
+	BindMomentAssetTx(ctx context.Context, tx mysqlx.Tx, momentID, objectID int64) error
 }
 
 // Outbox emits domain events on publication.
@@ -38,28 +40,28 @@ type Outbox interface {
 
 // PublishInput is the input to Publish.
 type PublishInput struct {
-	AuthorID       int64
-	Content        string
-	Country        string
-	Province       string
-	City           string
-	PlaceName      string
-	AssetIDs       []int64
-	Visibility     string // self|all_friends|selected|tag|exclude
-	AllowedUserIDs []int64
-	TagID          int64
+	AuthorID        int64
+	Content         string
+	Country         string
+	Province        string
+	City            string
+	PlaceName       string
+	AssetIDs        []int64
+	Visibility      string // self|all_friends|selected|tag|exclude
+	AllowedUserIDs  []int64
+	TagID           int64
 	ExcludedUserIDs []int64
-	AllowComments  *bool
-	AllowLikes     *bool
+	AllowComments   *bool
+	AllowLikes      *bool
 }
 
 // Service is the moment domain service.
 type Service struct {
-	db    *sql.DB
+	db      *sql.DB
 	contact Contact
-	media  Media
-	outbox Outbox
-	now    func() time.Time
+	media   Media
+	outbox  Outbox
+	now     func() time.Time
 }
 
 func New(db *sql.DB, c Contact, m Media, o Outbox, now func() time.Time) *Service {
@@ -112,6 +114,9 @@ func (s *Service) Publish(ctx context.Context, in *PublishInput) (int64, error) 
 			if err := insertAsset(ctx, tx, momentID, aid, i, now); err != nil {
 				return err
 			}
+			if err := s.media.BindMomentAssetTx(ctx, tx, momentID, aid); err != nil {
+				return err
+			}
 		}
 		for i := range rows {
 			rows[i].MomentID = momentID
@@ -120,7 +125,7 @@ func (s *Service) Publish(ctx context.Context, in *PublishInput) (int64, error) 
 			return err
 		}
 		if s.outbox != nil {
-			if err := s.outbox.Emit(ctx, tx, "moment.published", momentID, "wechat.moment.push"); err != nil {
+			if err := s.outbox.Emit(ctx, tx, "moment.published", momentID, mq.QueueNotification); err != nil {
 				return err
 			}
 		}
@@ -368,10 +373,11 @@ func (s *Service) Like(ctx context.Context, momentID, userID int64) error {
 		if !m.AllowLikes && userID != m.AuthorID {
 			return apperrors.Invalid("likes disabled")
 		}
-		if err := insertLike(ctx, tx, momentID, userID, now); err != nil {
+		inserted, err := insertLike(ctx, tx, momentID, userID, now)
+		if err != nil {
 			return err
 		}
-		if userID != m.AuthorID {
+		if inserted && userID != m.AuthorID {
 			return insertNotification(ctx, tx, NotificationRow{RecipientID: m.AuthorID, MomentID: momentID, Kind: "like", ActorID: userID}, now)
 		}
 		return nil
@@ -635,7 +641,7 @@ func (s *Service) PublishDueSchedules(ctx context.Context, worker string) (int, 
 		}
 		if err := s.publishLeased(ctx, leased, worker, now); err != nil {
 			failErr := mysqlx.WithinTx(ctx, s.db, func(tx mysqlx.Tx) error {
-				return markScheduleFailed(ctx, tx, leased.ID, err.Error(), now)
+				return markScheduleFailed(ctx, tx, leased.ID, leased.ExecutionVersion, worker, err.Error(), now)
 			})
 			if failErr != nil {
 				return published, fmt.Errorf("publish schedule %d: %w (fail: %v)", leased.ID, err, failErr)
@@ -665,6 +671,9 @@ func (s *Service) publishLeased(ctx context.Context, sch *ScheduleRow, worker st
 			if err := insertAsset(ctx, tx, momentID, aid, i, now); err != nil {
 				return err
 			}
+			if err := s.media.BindMomentAssetTx(ctx, tx, momentID, aid); err != nil {
+				return err
+			}
 		}
 		for i := range vis {
 			vis[i].MomentID = momentID
@@ -672,7 +681,7 @@ func (s *Service) publishLeased(ctx context.Context, sch *ScheduleRow, worker st
 		if err := insertVisibility(ctx, tx, vis, now); err != nil {
 			return err
 		}
-		if err := markSchedulePublished(ctx, tx, sch.ID, momentID, now); err != nil {
+		if err := markSchedulePublished(ctx, tx, sch.ID, momentID, sch.ExecutionVersion, worker, now); err != nil {
 			return err
 		}
 		return nil

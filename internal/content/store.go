@@ -21,17 +21,17 @@ type AccountRow struct {
 }
 
 type ArticleRow struct {
-	ID            int64          `json:"id,string"`
-	AccountID     int64          `json:"account_id,string"`
-	Title         string         `json:"title"`
-	CoverID       *int64         `json:"cover_media_id,omitempty,string"`
-	Summary       string         `json:"summary"`
-	Body          string         `json:"body"`
-	Status        string         `json:"status"`
-	PublishedAt   *time.Time     `json:"published_at,omitempty"`
-	UnpublishedAt *time.Time     `json:"unpublished_at,omitempty"`
-	CreatedAt     time.Time      `json:"created_at"`
-	UpdatedAt     time.Time      `json:"updated_at"`
+	ID            int64      `json:"id,string"`
+	AccountID     int64      `json:"account_id,string"`
+	Title         string     `json:"title"`
+	CoverID       *int64     `json:"cover_media_id,omitempty,string"`
+	Summary       string     `json:"summary"`
+	Body          string     `json:"body"`
+	Status        string     `json:"status"`
+	PublishedAt   *time.Time `json:"published_at,omitempty"`
+	UnpublishedAt *time.Time `json:"unpublished_at,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
 }
 
 type MenuRow struct {
@@ -53,15 +53,15 @@ type FollowerRow struct {
 }
 
 type SessionRow struct {
-	ID           int64      `json:"id,string"`
-	AccountID    int64      `json:"official_account_id,string"`
-	UserID       int64      `json:"user_id,string"`
-	Number       int        `json:"session_number"`
-	ConversationID int64    `json:"conversation_id,string"`
-	Status       string     `json:"status"`
-	ClosedBy     *int64     `json:"closed_by,omitempty,string"`
-	ClosedAt     *time.Time `json:"closed_at,omitempty"`
-	CreatedAt    time.Time  `json:"created_at"`
+	ID             int64      `json:"id,string"`
+	AccountID      int64      `json:"official_account_id,string"`
+	UserID         int64      `json:"user_id,string"`
+	Number         int        `json:"session_number"`
+	ConversationID int64      `json:"conversation_id,string"`
+	Status         string     `json:"status"`
+	ClosedBy       *int64     `json:"closed_by,omitempty,string"`
+	ClosedAt       *time.Time `json:"closed_at,omitempty"`
+	CreatedAt      time.Time  `json:"created_at"`
 }
 
 type NotificationRow struct {
@@ -369,16 +369,26 @@ func listMenu(ctx context.Context, db mysqlx.DBTX, accountID int64) ([]MenuRow, 
 
 // --- notifications ---
 
-func insertNotification(ctx context.Context, tx mysqlx.Tx, r *NotificationRow, now time.Time) (int64, error) {
+func insertNotification(ctx context.Context, tx mysqlx.Tx, r *NotificationRow, now time.Time) (int64, bool, error) {
 	res, err := tx.ExecContext(ctx,
-		`INSERT INTO official_notifications (account_id, user_id, kind, article_id, title, created_at)
+		`INSERT IGNORE INTO official_notifications (account_id, user_id, kind, article_id, title, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?)`,
 		r.AccountID, r.UserID, r.Kind, r.ArticleID, r.Title, now)
 	if err != nil {
-		return 0, fmt.Errorf("content: insert notification: %w", err)
+		return 0, false, fmt.Errorf("content: insert notification: %w", err)
 	}
-	id, _ := res.LastInsertId()
-	return id, nil
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, false, fmt.Errorf("content: notification affected: %w", err)
+	}
+	if n == 0 {
+		return 0, false, nil
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, true, fmt.Errorf("content: notification id: %w", err)
+	}
+	return id, true, nil
 }
 
 func countArticleNotificationsToday(ctx context.Context, db mysqlx.DBTX, accountID, userID int64, dayStart time.Time) (int, error) {

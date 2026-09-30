@@ -8,6 +8,7 @@ import (
 	"time"
 
 	apperrors "github.com/example/wechat/internal/platform/errors"
+	"github.com/example/wechat/internal/platform/mq"
 	"github.com/example/wechat/internal/platform/mysqlx"
 )
 
@@ -42,9 +43,9 @@ func New(db *sql.DB, op Operator, conv Conversation, ob Outbox, now func() time.
 // --- accounts (R1, R2) ---
 
 type CreateAccountInput struct {
-	Name     string
-	Intro    string
-	AvatarID *int64
+	Name       string
+	Intro      string
+	AvatarID   *int64
 	OperatorID int64
 }
 
@@ -173,7 +174,7 @@ func (s *Service) Follow(ctx context.Context, accountID, userID int64) error {
 		if err := insertFollower(ctx, tx, accountID, userID, now); err != nil {
 			return err
 		}
-		welcomeID, err := insertNotification(ctx, tx, &NotificationRow{
+		welcomeID, _, err := insertNotification(ctx, tx, &NotificationRow{
 			AccountID: accountID,
 			UserID:    userID,
 			Kind:      "welcome",
@@ -183,7 +184,7 @@ func (s *Service) Follow(ctx context.Context, accountID, userID int64) error {
 			return err
 		}
 		if s.outbox != nil {
-			if err := s.outbox.Emit(ctx, tx, "official.notification.created", welcomeID, "wechat.push"); err != nil {
+			if err := s.outbox.Emit(ctx, tx, "official.notification.created", welcomeID, mq.QueueNotification); err != nil {
 				return err
 			}
 		}
@@ -316,7 +317,7 @@ func (s *Service) PublishArticle(ctx context.Context, operatorID, articleID int6
 			return nil
 		}
 		if s.outbox != nil {
-			if err := s.outbox.Emit(ctx, tx, "official.article.published", articleID, "wechat.article.notify"); err != nil {
+			if err := s.outbox.Emit(ctx, tx, "official.article.published", articleID, mq.QueueContentService); err != nil {
 				return err
 			}
 		}
@@ -524,6 +525,15 @@ func (s *Service) StartSession(ctx context.Context, accountID, userID int64) (*S
 	if err != nil {
 		return nil, err
 	}
+	if mysqlx.IsDuplicate(err, "uk_ssessions_key") {
+		existing, findErr := findActiveSession(ctx, s.db, accountID, userID)
+		if findErr == nil && existing != nil {
+			return &StartSessionResult{
+				ID: existing.ID, Number: existing.Number,
+				ConversationID: existing.ConversationID, Created: false,
+			}, nil
+		}
+	}
 	return result, nil
 }
 
@@ -674,21 +684,31 @@ func (s *Service) MarkNotificationsRead(ctx context.Context, userID int64, ids [
 // It inserts at most 3 article notifications per active, non-muted follower per
 // UTC day, skipping any article that already has notifications (I4).
 func (s *Service) FanoutArticleNotifications(ctx context.Context, articleID int64) (int, error) {
-	art, err := findArticle(ctx, s.db, articleID)
+	var sent int
+	err := mysqlx.WithinTx(ctx, s.db, func(tx mysqlx.Tx) error {
+		var err error
+		sent, err = s.FanoutArticleNotificationsTx(ctx, tx, articleID)
+		return err
+	})
+	return sent, err
+}
+
+func (s *Service) FanoutArticleNotificationsTx(ctx context.Context, tx mysqlx.Tx, articleID int64) (int, error) {
+	art, err := findArticle(ctx, tx, articleID)
 	if err != nil {
 		return 0, err
 	}
 	if art == nil || art.Status != "published" {
 		return 0, nil
 	}
-	existing, err := countExistingArticleNotifications(ctx, s.db, art.AccountID, articleID)
+	existing, err := countExistingArticleNotifications(ctx, tx, art.AccountID, articleID)
 	if err != nil {
 		return 0, err
 	}
 	if existing > 0 {
 		return 0, nil
 	}
-	followers, err := listActiveFollowers(ctx, s.db, art.AccountID)
+	followers, err := listActiveFollowers(ctx, tx, art.AccountID)
 	if err != nil {
 		return 0, err
 	}
@@ -699,7 +719,7 @@ func (s *Service) FanoutArticleNotifications(ctx context.Context, articleID int6
 		if f.Muted {
 			continue
 		}
-		n, err := countArticleNotificationsToday(ctx, s.db, f.AccountID, f.UserID, dayStart)
+		n, err := countArticleNotificationsToday(ctx, tx, f.AccountID, f.UserID, dayStart)
 		if err != nil {
 			return sent, err
 		}
@@ -707,7 +727,7 @@ func (s *Service) FanoutArticleNotifications(ctx context.Context, articleID int6
 			continue
 		}
 		articleIDCopy := art.ID
-		_, err = insertNotification(ctx, s.db, &NotificationRow{
+		_, inserted, err := insertNotification(ctx, tx, &NotificationRow{
 			AccountID: f.AccountID,
 			UserID:    f.UserID,
 			Kind:      "article",
@@ -717,7 +737,9 @@ func (s *Service) FanoutArticleNotifications(ctx context.Context, articleID int6
 		if err != nil {
 			return sent, err
 		}
-		sent++
+		if inserted {
+			sent++
+		}
 	}
 	return sent, nil
 }

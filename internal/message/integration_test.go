@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -26,10 +27,19 @@ func (fakeFriend) CanSendMessage(_ context.Context, from, to int64) (bool, strin
 	}
 	return true, "", nil
 }
+func (fakeFriend) CanSendMessageTx(_ context.Context, _ mysqlx.Tx, from, to int64) (bool, string, error) {
+	if from == 0 || to == 0 {
+		return false, "no friendship", nil
+	}
+	return true, "", nil
+}
 
 type fakeGroup struct{}
 
 func (fakeGroup) CanSend(_ context.Context, groupID, userID int64) error { return nil }
+func (fakeGroup) CanSendTx(_ context.Context, _ mysqlx.Tx, groupID, userID int64) error {
+	return nil
+}
 func (fakeGroup) IsModerator(_ context.Context, groupID, userID int64) (bool, error) {
 	return true, nil
 }
@@ -39,14 +49,32 @@ func (fakeGroup) GroupByConversation(_ context.Context, conversationID int64) (G
 func (fakeGroup) WasMemberAt(_ context.Context, groupID, userID int64, at time.Time) (bool, error) {
 	return true, nil
 }
+func (fakeGroup) WasMemberAtMany(_ context.Context, groupID, userID int64, ats []time.Time) ([]bool, error) {
+	out := make([]bool, len(ats))
+	for i := range out {
+		out[i] = true
+	}
+	return out, nil
+}
 func (fakeGroup) ListGroupConversationsForUser(_ context.Context, userID int64) ([]GroupConvView, error) {
 	return nil, nil
 }
 
 type fakeMedia struct{}
 
-func (fakeMedia) AssertReady(_ context.Context, ownerID, objectID int64, kind string) error { return nil }
-func (fakeMedia) OnReferencesRemoved(_ context.Context, objectIDs []int64) error             { return nil }
+func (fakeMedia) AssertReady(_ context.Context, ownerID, objectID int64, kind string) error {
+	return nil
+}
+func (fakeMedia) AssertReadyTx(_ context.Context, _ mysqlx.Tx, ownerID, objectID int64, kind string) error {
+	return nil
+}
+func (fakeMedia) BindMessageAssetTx(_ context.Context, _ mysqlx.Tx, messageID, objectID int64, participantIDs []int64) error {
+	return nil
+}
+func (fakeMedia) EnqueueGCTx(_ context.Context, _ mysqlx.Tx, objectIDs []int64, purgeAfter time.Time) error {
+	return nil
+}
+func (fakeMedia) OnReferencesRemoved(_ context.Context, objectIDs []int64) error { return nil }
 
 type env struct {
 	db   *sql.DB
@@ -73,6 +101,15 @@ func newEnv(t *testing.T) *env {
 }
 
 var seq atomic.Int64
+
+type deniedInTransactionFriend struct{}
+
+func (deniedInTransactionFriend) CanSendMessage(_ context.Context, from, to int64) (bool, string, error) {
+	return true, "", nil
+}
+func (deniedInTransactionFriend) CanSendMessageTx(_ context.Context, _ mysqlx.Tx, from, to int64) (bool, string, error) {
+	return false, "friend deleted concurrently", nil
+}
 
 func (e *env) newUser(t *testing.T) int64 {
 	t.Helper()
@@ -136,6 +173,79 @@ func TestT1IdempotentSend(t *testing.T) {
 	_ = e.db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM messages WHERE conversation_id = ?`, cid).Scan(&n)
 	if n != 1 {
 		t.Fatalf("want 1 message, got %d", n)
+	}
+}
+
+func TestSendReauthorizesInsideTransaction(t *testing.T) {
+	e := newEnv(t)
+	a, b := e.newUser(t), e.newUser(t)
+	cid := e.newDirect(t, a, b)
+	// This simulates a friend deletion that happened after the lock-free
+	// precheck but before the send transaction committed.
+	svc := New(e.db, deniedInTransactionFriend{}, fakeGroup{}, fakeMedia{}, e.conv, e.clk.Now)
+	_, err := svc.Send(context.Background(), a, cid, SendInput{
+		ClientMsgID: "race-auth", Type: TypeText, Payload: textPayload("hello"),
+	})
+	if ae := apperrors.AsApp(err); ae == nil || ae.Code != apperrors.Forbidden {
+		t.Fatalf("expected forbidden, got %v", err)
+	}
+	var n int
+	if err := e.db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM messages WHERE sender_id = ? AND client_msg_id = 'race-auth'`, a).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("denied send committed %d messages", n)
+	}
+}
+
+func TestConcurrentPinsNeverExceedQuota(t *testing.T) {
+	e := newEnv(t)
+	a, b := e.newUser(t), e.newUser(t)
+	cid := e.newDirect(t, a, b)
+	ids := make([]int64, MaxMessagePins+10)
+	for i := range ids {
+		r, err := e.svc.Send(context.Background(), a, cid, SendInput{
+			ClientMsgID: fmt.Sprintf("race-pin-%d", i), Type: TypeText, Payload: textPayload("x"),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids[i] = r.MessageID
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, len(ids))
+	for i, id := range ids {
+		wg.Add(1)
+		go func(i int, id int64) {
+			defer wg.Done()
+			errs[i] = e.svc.Pin(context.Background(), a, cid, id)
+		}(i, id)
+	}
+	wg.Wait()
+
+	var n int
+	if err := e.db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM message_pins WHERE conversation_id = ?`, cid).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != MaxMessagePins {
+		t.Fatalf("pins = %d, want exactly %d", n, MaxMessagePins)
+	}
+	quotaFailures := 0
+	for _, err := range errs {
+		if err == nil {
+			continue
+		}
+		if ae := apperrors.AsApp(err); ae.Code == apperrors.QuotaExceeded {
+			quotaFailures++
+		} else {
+			t.Fatalf("unexpected pin error: %v", err)
+		}
+	}
+	if quotaFailures != len(ids)-MaxMessagePins {
+		t.Fatalf("quota failures = %d, want %d", quotaFailures, len(ids)-MaxMessagePins)
 	}
 }
 

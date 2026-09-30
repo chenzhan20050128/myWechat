@@ -365,6 +365,9 @@ func (s *Service) UpdateFriendSettings(ctx context.Context, me, friendID int64, 
 	lo, hi := normalizePair(me, friendID)
 	var out Settings
 	err := mysqlx.WithinTx(ctx, s.db, func(tx mysqlx.Tx) error {
+		if _, err := lockEpochRow(ctx, tx, lo, hi); err != nil {
+			return err
+		}
 		current, err := loadSettings(ctx, tx, me, []int64{friendID})
 		if err != nil {
 			return err
@@ -443,6 +446,34 @@ func (s *Service) CanSendMessage(ctx context.Context, from, to int64) (bool, str
 		return false, "", err
 	}
 	theirs, err := loadSettings(ctx, s.db, to, []int64{from})
+	if err != nil {
+		return false, "", err
+	}
+	ok, reason := decideSend(settingsOf(mine, to), settingsOf(theirs, from))
+	return ok, reason, nil
+}
+
+// CanSendMessageTx performs the same permission decision inside the caller's
+// transaction and locks the pair epoch first, serializing it with friendship
+// deletion and message-permission updates.
+func (s *Service) CanSendMessageTx(ctx context.Context, tx mysqlx.Tx, from, to int64) (bool, string, error) {
+	if from <= 0 || to <= 0 || from == to {
+		return false, ReasonNotFriend, nil
+	}
+	lo, hi := normalizePair(from, to)
+	if _, err := lockEpochRow(ctx, tx, lo, hi); err != nil {
+		return false, "", err
+	}
+	if _, ok, err := activeFriendship(ctx, tx, lo, hi); err != nil {
+		return false, "", err
+	} else if !ok {
+		return false, ReasonNotFriend, nil
+	}
+	mine, err := loadSettings(ctx, tx, from, []int64{to})
+	if err != nil {
+		return false, "", err
+	}
+	theirs, err := loadSettings(ctx, tx, to, []int64{from})
 	if err != nil {
 		return false, "", err
 	}

@@ -4,8 +4,10 @@ package operator
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"database/sql"
 	"fmt"
+	"math/big"
 	"os"
 	"sync/atomic"
 	"testing"
@@ -45,7 +47,8 @@ var userSeq atomic.Int64
 
 func (e *env) newUser(t *testing.T) int64 {
 	t.Helper()
-	phone := fmt.Sprintf("+86%08d%04d", time.Now().UnixNano()%100000000, userSeq.Add(1))
+	random, _ := cryptorand.Int(cryptorand.Reader, big.NewInt(100000000))
+	phone := fmt.Sprintf("+86%08d%04d", random.Int64(), userSeq.Add(1))
 	account := "u" + phone[3:]
 	res, err := e.db.ExecContext(context.Background(),
 		`INSERT INTO users (phone, account_name, password_hash, created_at, updated_at)

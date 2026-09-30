@@ -6,8 +6,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -23,8 +26,12 @@ import (
 	"github.com/example/wechat/internal/platform/clock"
 	"github.com/example/wechat/internal/platform/config"
 	"github.com/example/wechat/internal/platform/logger"
+	"github.com/example/wechat/internal/platform/mq"
 	"github.com/example/wechat/internal/platform/mysqlx"
+	"github.com/example/wechat/internal/platform/outbox"
 	"github.com/example/wechat/internal/platform/storage"
+	"github.com/example/wechat/internal/runtime"
+	"github.com/example/wechat/internal/ws"
 )
 
 func main() {
@@ -42,7 +49,11 @@ func main() {
 	defer db.Close()
 
 	clk := clock.System
-	cacheStore := cache.New(cfg.Cache.Driver)
+	cacheStore, err := cache.New(cfg.Cache.Driver, cfg.Cache.RedisAddr, cfg.Cache.RedisDB)
+	if err != nil {
+		log.Error("cache: " + err.Error())
+		os.Exit(1)
+	}
 	_ = cacheStore
 
 	var objectStore storage.ObjectStore
@@ -66,69 +77,168 @@ func main() {
 	groups := group.New(db, convs, contacts, nil, clk.Now)
 	messages := message.New(db, contacts, groupMessageAdapter{g: groups}, mediaSvc, convs, clk.Now)
 	groups.SetMessenger(messages)
-	moments := moment.New(db, contactMomentAdapter{c: contacts}, mediaSvc, nil, clk.Now)
+	moments := moment.New(db, contactMomentAdapter{c: contacts}, mediaSvc, outboxEmitter{}, clk.Now)
 	backups := backup.New(db, backupSourcesStub{}, clk.Now)
-	contentSvc := content.New(db, operatorWhitelist{ids: cfg.Operator.IDs}, convs, nil, clk.Now)
-	_ = contentSvc
+	contentSvc := content.New(db, operatorWhitelist{ids: cfg.Operator.IDs}, convs, outboxEmitter{}, clk.Now)
+	hub := ws.NewHub()
+	messages.SetPusher(hub)
+
+	router := runtime.NewLocalRouter(db, "local-router", func(error) runtime.FailureClass {
+		return runtime.Transient
+	}, clk.Now)
+	router.Handle(mq.QueueMessagePush, "message.stored", func(ctx context.Context, _ mysqlx.Tx, ev mq.Event) error {
+		id, err := strconv.ParseInt(ev.AggregateID, 10, 64)
+		if err != nil {
+			return err
+		}
+		return messages.PushMessage(ctx, id, ev.Type)
+	})
+	router.Handle(mq.QueueMessagePush, "message.recalled", func(ctx context.Context, _ mysqlx.Tx, ev mq.Event) error {
+		id, err := strconv.ParseInt(ev.AggregateID, 10, 64)
+		if err != nil {
+			return err
+		}
+		return messages.PushMessage(ctx, id, ev.Type)
+	})
+	router.HandleQueue(mq.QueueMediaProcess, func(ctx context.Context, tx mysqlx.Tx, ev mq.Event) error {
+		id, err := strconv.ParseInt(ev.AggregateID, 10, 64)
+		if err != nil {
+			return err
+		}
+		return mediaSvc.ProcessTx(ctx, tx, id)
+	})
+	router.Handle(mq.QueueContentService, "official.article.published", func(ctx context.Context, tx mysqlx.Tx, ev mq.Event) error {
+		id, err := strconv.ParseInt(ev.AggregateID, 10, 64)
+		if err != nil {
+			return err
+		}
+		_, err = contentSvc.FanoutArticleNotificationsTx(ctx, tx, id)
+		return err
+	})
+	router.HandleQueue(mq.QueueNotification, func(context.Context, mysqlx.Tx, mq.Event) error {
+		return nil
+	})
+
+	relay := runtime.NewRelay(db, router, workerID(), clk.Now)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go func() {
-		t := time.NewTicker(time.Minute)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				if n, err := messages.SweepExpired(ctx, 1000); err != nil {
-					log.Error("sweep messages: " + err.Error())
-				} else if n > 0 {
-					log.Info("swept expired messages", "count", n)
-				}
-				if n, err := groups.ScanOverdueTodos(ctx); err != nil {
-					log.Error("scan overdue todos: " + err.Error())
-				} else if n > 0 {
-					log.Info("overdue todos", "count", n)
-				}
-				if n, err := groups.CleanupExpiredMutes(ctx); err != nil {
-					log.Error("prune mutes: " + err.Error())
-				} else if n > 0 {
-					log.Info("pruned expired mutes", "count", n)
-				}
-				if n, err := contacts.ExpireStaleRequests(ctx); err != nil {
-					log.Error("expire contact requests: " + err.Error())
-				} else if n > 0 {
-					log.Info("expired stale contact requests", "count", n)
-				}
-				if n, err := mediaSvc.ExpireUploads(ctx); err != nil {
-					log.Error("expire uploads: " + err.Error())
-				} else if n > 0 {
-					log.Info("expired upload sessions", "count", n)
-				}
-				if n, err := moments.PublishDueSchedules(ctx, "worker-1"); err != nil {
-					log.Error("publish due moment schedules: " + err.Error())
-				} else if n > 0 {
-					log.Info("published scheduled moments", "count", n)
-				}
-				if err := moments.RecoverStaleLeases(ctx); err != nil {
-					log.Error("recover moment schedule leases: " + err.Error())
-				}
-				if n, err := backups.ExpireBackups(ctx); err != nil {
-					log.Error("expire backups: " + err.Error())
-				} else if n > 0 {
-					log.Info("expired backups", "count", n)
-				}
-			}
+	startTask(ctx, log, "relay", 200*time.Millisecond, 5*time.Second, func(ctx context.Context) error {
+		n, err := relay.RunOnce(ctx)
+		if n > 0 {
+			log.Info("published outbox events", "count", n)
 		}
-	}()
+		return err
+	})
+	startTask(ctx, log, "inbox-retry", 10*time.Second, 5*time.Second, func(ctx context.Context) error {
+		n, err := router.RunRetriesOnce(ctx, 100)
+		if n > 0 {
+			log.Info("completed retry events", "count", n)
+		}
+		return err
+	})
+	startTask(ctx, log, "message-retention", time.Minute, 30*time.Second, func(ctx context.Context) error {
+		n, err := messages.SweepExpired(ctx, 1000)
+		if n > 0 {
+			log.Info("swept expired messages", "count", n)
+		}
+		return err
+	})
+	startTask(ctx, log, "group-todo-overdue", time.Minute, 30*time.Second, func(ctx context.Context) error {
+		n, err := groups.ScanOverdueTodos(ctx)
+		if n > 0 {
+			log.Info("overdue todos", "count", n)
+		}
+		return err
+	})
+	startTask(ctx, log, "group-mute-gc", 24*time.Hour, 30*time.Second, func(ctx context.Context) error {
+		n, err := groups.CleanupExpiredMutes(ctx)
+		if n > 0 {
+			log.Info("pruned expired mutes", "count", n)
+		}
+		return err
+	})
+	startTask(ctx, log, "contact-request-expiry", time.Minute, 30*time.Second, func(ctx context.Context) error {
+		n, err := contacts.ExpireStaleRequests(ctx)
+		if n > 0 {
+			log.Info("expired stale contact requests", "count", n)
+		}
+		return err
+	})
+	startTask(ctx, log, "upload-expiry", 10*time.Minute, time.Minute, func(ctx context.Context) error {
+		n, err := mediaSvc.ExpireUploads(ctx)
+		if n > 0 {
+			log.Info("expired upload sessions", "count", n)
+		}
+		return err
+	})
+	startTask(ctx, log, "media-gc", time.Minute, time.Minute, func(ctx context.Context) error {
+		n, err := mediaSvc.ProcessGCTasks(ctx, 1000)
+		if n > 0 {
+			log.Info("processed media GC tasks", "count", n)
+		}
+		return err
+	})
+	startTask(ctx, log, "moment-schedule", 10*time.Second, 30*time.Second, func(ctx context.Context) error {
+		n, err := moments.PublishDueSchedules(ctx, workerID())
+		if n > 0 {
+			log.Info("published scheduled moments", "count", n)
+		}
+		return err
+	})
+	startTask(ctx, log, "moment-lease-recovery", 10*time.Second, 30*time.Second, func(ctx context.Context) error {
+		return moments.RecoverStaleLeases(ctx)
+	})
+	startTask(ctx, log, "backup-expiry", time.Hour, time.Minute, func(ctx context.Context) error {
+		n, err := backups.ExpireBackups(ctx)
+		if n > 0 {
+			log.Info("expired backups", "count", n)
+		}
+		return err
+	})
 
 	log.Info("worker running")
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	<-sigCh
 	log.Info("shutting down")
+}
+
+func workerID() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "unknown-host"
+	}
+	return fmt.Sprintf("%s-%d", host, os.Getpid())
+}
+
+func startTask(ctx context.Context, log *slog.Logger, name string, interval, timeout time.Duration, task func(context.Context) error) {
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				taskCtx, cancel := context.WithTimeout(ctx, timeout)
+				if err := runTask(taskCtx, task); err != nil {
+					log.Error("worker task failed", "task", name, "error", err)
+				}
+				cancel()
+			}
+		}
+	}()
+}
+
+func runTask(ctx context.Context, task func(context.Context) error) (err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("panic: %v", p)
+		}
+	}()
+	return task(ctx)
 }
 
 // groupMessageAdapter mirrors cmd/api's adapter (kept duplicated here because
@@ -138,6 +248,9 @@ type groupMessageAdapter struct{ g *group.Service }
 
 func (a groupMessageAdapter) CanSend(ctx context.Context, groupID, userID int64) error {
 	return a.g.CanSend(ctx, groupID, userID)
+}
+func (a groupMessageAdapter) CanSendTx(ctx context.Context, tx mysqlx.Tx, groupID, userID int64) error {
+	return a.g.CanSendTx(ctx, tx, groupID, userID)
 }
 func (a groupMessageAdapter) IsModerator(ctx context.Context, groupID, userID int64) (bool, error) {
 	return a.g.IsModerator(ctx, groupID, userID)
@@ -154,6 +267,9 @@ func (a groupMessageAdapter) GroupByConversation(ctx context.Context, conversati
 func (a groupMessageAdapter) WasMemberAt(ctx context.Context, groupID, userID int64, at time.Time) (bool, error) {
 	return a.g.WasMemberAt(ctx, groupID, userID, at)
 }
+func (a groupMessageAdapter) WasMemberAtMany(ctx context.Context, groupID, userID int64, ats []time.Time) ([]bool, error) {
+	return a.g.WasMemberAtMany(ctx, groupID, userID, ats)
+}
 func (a groupMessageAdapter) ListGroupConversationsForUser(ctx context.Context, userID int64) ([]message.GroupConvView, error) {
 	rows, err := a.g.ListGroupConversationsForUser(ctx, userID)
 	if err != nil {
@@ -168,6 +284,14 @@ func (a groupMessageAdapter) ListGroupConversationsForUser(ctx context.Context, 
 
 // contactMomentAdapter mirrors cmd/api's adapter.
 type contactMomentAdapter struct{ c *contact.Service }
+
+type outboxEmitter struct{}
+
+func (outboxEmitter) Emit(ctx context.Context, tx mysqlx.Tx, eventType string, aggregateID int64, queue string) error {
+	return outbox.Emit(ctx, tx, outbox.Event{
+		Type: eventType, AggregateID: strconv.FormatInt(aggregateID, 10), Queue: queue,
+	})
+}
 
 func (a contactMomentAdapter) ActiveFriendsWithEpoch(ctx context.Context, authorID int64) ([]moment.FriendEpoch, error) {
 	rows, err := a.c.ActiveFriendsWithEpoch(ctx, authorID)

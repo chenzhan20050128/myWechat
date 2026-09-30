@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	apperrors "github.com/example/wechat/internal/platform/errors"
@@ -14,18 +15,18 @@ import (
 
 // MessageRow is a `messages` row.
 type MessageRow struct {
-	ID             int64
-	ConversationID int64
+	ID              int64
+	ConversationID  int64
 	ConversationSeq uint64
-	SenderID       int64
-	SenderType     string
-	ClientMsgID    string
-	Type           string
-	Payload        json.RawMessage
-	Status         string
-	CreatedAt      time.Time
-	ExpiresAt      time.Time
-	RecalledAt     *time.Time
+	SenderID        int64
+	SenderType      string
+	ClientMsgID     string
+	Type            string
+	Payload         json.RawMessage
+	Status          string
+	CreatedAt       time.Time
+	ExpiresAt       time.Time
+	RecalledAt      *time.Time
 }
 
 // AssetRow is a message_assets row.
@@ -406,6 +407,13 @@ func deleteAssets(ctx context.Context, tx mysqlx.Tx, messageID int64) error {
 	return err
 }
 
+func deleteMessageReferences(ctx context.Context, tx mysqlx.Tx, messageID int64) error {
+	_, err := tx.ExecContext(ctx, `
+		DELETE FROM media_references WHERE biz_type = 'message' AND biz_id = ?`,
+		strconv.FormatInt(messageID, 10))
+	return err
+}
+
 // ---------------------------------------------------------------------------
 // Read-side helpers for views (A2/A3/A12).
 
@@ -431,6 +439,51 @@ func loadReference(ctx context.Context, db mysqlx.DBTX, messageID int64) (Refere
 	return r, err
 }
 
+func loadReferencesBatch(ctx context.Context, db mysqlx.DBTX, messageIDs []int64) (map[int64]ReferenceRow, error) {
+	out := make(map[int64]ReferenceRow, len(messageIDs))
+	if len(messageIDs) == 0 {
+		return out, nil
+	}
+	args := intsToAny(messageIDs)
+	rows, err := db.QueryContext(ctx, `
+		SELECT message_id, ref_message_id, ref_sender_id, ref_type, ref_digest
+		FROM message_references WHERE message_id IN (`+mysqlx.Placeholders(len(messageIDs))+`)`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var r ReferenceRow
+		if err := rows.Scan(&r.MessageID, &r.RefMsgID, &r.RefSenderID, &r.RefType, &r.RefDigest); err != nil {
+			return nil, err
+		}
+		out[r.MessageID] = r
+	}
+	return out, rows.Err()
+}
+
+func messageStatuses(ctx context.Context, db mysqlx.DBTX, ids []int64) (map[int64]string, error) {
+	out := make(map[int64]string, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := db.QueryContext(ctx, `
+		SELECT id, status FROM messages WHERE id IN (`+mysqlx.Placeholders(len(ids))+`)`, intsToAny(ids)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var status string
+		if err := rows.Scan(&id, &status); err != nil {
+			return nil, err
+		}
+		out[id] = status
+	}
+	return out, rows.Err()
+}
+
 // assetRowsForMessage returns all asset rows for one message.
 func assetRowsForMessage(ctx context.Context, db mysqlx.DBTX, messageID int64) ([]AssetRow, error) {
 	rows, err := db.QueryContext(ctx, `
@@ -450,15 +503,37 @@ func assetRowsForMessage(ctx context.Context, db mysqlx.DBTX, messageID int64) (
 	return out, rows.Err()
 }
 
+func assetRowsForMessages(ctx context.Context, db mysqlx.DBTX, messageIDs []int64) (map[int64][]AssetRow, error) {
+	out := make(map[int64][]AssetRow, len(messageIDs))
+	if len(messageIDs) == 0 {
+		return out, nil
+	}
+	rows, err := db.QueryContext(ctx, `
+		SELECT id, message_id, media_object_id, kind FROM message_assets
+		WHERE message_id IN (`+mysqlx.Placeholders(len(messageIDs))+`)`, intsToAny(messageIDs)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var a AssetRow
+		if err := rows.Scan(&a.ID, &a.MessageID, &a.MediaObjectID, &a.Kind); err != nil {
+			return nil, err
+		}
+		out[a.MessageID] = append(out[a.MessageID], a)
+	}
+	return out, rows.Err()
+}
+
 // pinnedMessageView is one element of A12.
 type pinnedMessageView struct {
-	MsgID       int64
-	Payload     json.RawMessage
-	MsgType     string
-	Status      string
-	SenderID    int64
-	Seq         uint64
-	CreatedAt   time.Time
+	MsgID     int64
+	Payload   json.RawMessage
+	MsgType   string
+	Status    string
+	SenderID  int64
+	Seq       uint64
+	CreatedAt time.Time
 }
 
 // listPinnedMessages loads pinned rows joined to their message bodies.
@@ -547,6 +622,25 @@ func listDirectConversationsForUser(ctx context.Context, db mysqlx.DBTX, userID 
 		FROM conversation_members cm
 		JOIN conversations c ON c.id = cm.conversation_id
 		WHERE cm.user_id = ? AND cm.left_at IS NULL AND c.type IN ('direct','transfer')`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+func conversationMemberIDs(ctx context.Context, db mysqlx.DBTX, conversationID int64) ([]int64, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT user_id FROM conversation_members
+		WHERE conversation_id = ? AND left_at IS NULL`, conversationID)
 	if err != nil {
 		return nil, err
 	}

@@ -76,16 +76,33 @@ func (l *Local) Put(_ context.Context, key string, r io.Reader, _ int64, _ strin
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+	dir := filepath.Dir(p)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	f, err := os.Create(p)
+	f, err := os.CreateTemp(dir, ".upload-*")
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	_, err = io.Copy(f, r)
-	return err
+	if _, err := io.Copy(f, r); err != nil {
+		_ = f.Close()
+		_ = os.Remove(f.Name())
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(f.Name())
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(f.Name())
+		return err
+	}
+	if err := os.Rename(f.Name(), p); err != nil {
+		_ = os.Remove(f.Name())
+		return err
+	}
+	return nil
 }
 
 func (l *Local) Get(_ context.Context, key string) (io.ReadCloser, error) {

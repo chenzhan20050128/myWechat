@@ -156,10 +156,17 @@ func likeExists(ctx context.Context, db mysqlx.DBTX, momentID, userID int64) (bo
 	return true, err
 }
 
-func insertLike(ctx context.Context, tx mysqlx.Tx, momentID, userID int64, now time.Time) error {
-	_, err := tx.ExecContext(ctx, `INSERT IGNORE INTO moment_likes (moment_id, user_id, created_at) VALUES (?, ?, ?)`,
+func insertLike(ctx context.Context, tx mysqlx.Tx, momentID, userID int64, now time.Time) (bool, error) {
+	res, err := tx.ExecContext(ctx, `INSERT IGNORE INTO moment_likes (moment_id, user_id, created_at) VALUES (?, ?, ?)`,
 		momentID, userID, now)
-	return err
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 func deleteLike(ctx context.Context, tx mysqlx.Tx, momentID, userID int64) error {
@@ -488,18 +495,40 @@ func loadScheduleContent(ctx context.Context, db mysqlx.DBTX, scheduleID int64, 
 	return m, assets, vis, nil
 }
 
-func markSchedulePublished(ctx context.Context, tx mysqlx.Tx, scheduleID, momentID int64, now time.Time) error {
-	_, err := tx.ExecContext(ctx, `
+func markSchedulePublished(ctx context.Context, tx mysqlx.Tx, scheduleID, momentID int64, executionVersion int, worker string, now time.Time) error {
+	res, err := tx.ExecContext(ctx, `
 		UPDATE moment_schedules SET status = 'published', moment_id = ?, published_at = ?, lease_owner = NULL, lease_until = NULL, updated_at = ?
-		WHERE id = ? AND status = 'scheduled'`, momentID, now, now, scheduleID)
-	return err
+		WHERE id = ? AND status = 'scheduled' AND execution_version = ? AND lease_owner = ? AND lease_until > ?`,
+		momentID, now, now, scheduleID, executionVersion, worker, now)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return apperrors.New(apperrors.StateConflict, "schedule lease is no longer current")
+	}
+	return nil
 }
 
-func markScheduleFailed(ctx context.Context, tx mysqlx.Tx, scheduleID int64, reason string, now time.Time) error {
-	_, err := tx.ExecContext(ctx, `
+func markScheduleFailed(ctx context.Context, tx mysqlx.Tx, scheduleID int64, executionVersion int, worker, reason string, now time.Time) error {
+	res, err := tx.ExecContext(ctx, `
 		UPDATE moment_schedules SET status = 'failed', fail_reason = ?, retry_count = retry_count + 1, lease_owner = NULL, lease_until = NULL, updated_at = ?
-		WHERE id = ?`, reason, now, scheduleID)
-	return err
+		WHERE id = ? AND status = 'scheduled' AND execution_version = ? AND lease_owner = ? AND lease_until > ?`,
+		reason, now, scheduleID, executionVersion, worker, now)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return apperrors.New(apperrors.StateConflict, "schedule lease is no longer current")
+	}
+	return nil
 }
 
 func markScheduleCancelled(ctx context.Context, tx mysqlx.Tx, scheduleID, authorID int64, now time.Time) error {
@@ -533,7 +562,7 @@ func resetScheduleForRetry(ctx context.Context, tx mysqlx.Tx, scheduleID, author
 func recoverStaleLeases(ctx context.Context, tx mysqlx.Tx, now time.Time) (int64, error) {
 	res, err := tx.ExecContext(ctx, `
 		UPDATE moment_schedules SET lease_owner = NULL, lease_until = NULL
-		WHERE status = 'scheduled' AND lease_until IS NOT NULL AND lease_until < now()`)
+		WHERE status = 'scheduled' AND lease_until IS NOT NULL AND lease_until < ?`, now)
 	if err != nil {
 		return 0, err
 	}

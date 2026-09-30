@@ -12,30 +12,32 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync/atomic"
 	"syscall"
 	"time"
 
-	apperrors "github.com/example/wechat/internal/platform/errors"
-	"github.com/example/wechat/internal/platform/argon"
 	"github.com/example/wechat/internal/audit"
 	"github.com/example/wechat/internal/auth"
+	"github.com/example/wechat/internal/backup"
 	"github.com/example/wechat/internal/contact"
 	"github.com/example/wechat/internal/content"
 	"github.com/example/wechat/internal/conversation"
 	"github.com/example/wechat/internal/device"
-	"github.com/example/wechat/internal/group"
-	"github.com/example/wechat/internal/backup"
 	"github.com/example/wechat/internal/favorite"
+	"github.com/example/wechat/internal/group"
 	"github.com/example/wechat/internal/media"
 	"github.com/example/wechat/internal/message"
 	"github.com/example/wechat/internal/moment"
 	"github.com/example/wechat/internal/operator"
+	"github.com/example/wechat/internal/platform/argon"
 	"github.com/example/wechat/internal/platform/cache"
 	"github.com/example/wechat/internal/platform/clock"
 	"github.com/example/wechat/internal/platform/config"
+	apperrors "github.com/example/wechat/internal/platform/errors"
 	"github.com/example/wechat/internal/platform/httpx"
 	"github.com/example/wechat/internal/platform/logger"
 	"github.com/example/wechat/internal/platform/mysqlx"
+	"github.com/example/wechat/internal/platform/outbox"
 	"github.com/example/wechat/internal/platform/ratelimit"
 	"github.com/example/wechat/internal/platform/sigtoken"
 	"github.com/example/wechat/internal/platform/storage"
@@ -57,7 +59,11 @@ func main() {
 	defer db.Close()
 
 	clk := clock.System
-	cacheStore := cache.New(cfg.Cache.Driver)
+	cacheStore, err := cache.New(cfg.Cache.Driver, cfg.Cache.RedisAddr, cfg.Cache.RedisDB)
+	if err != nil {
+		log.Error("cache: " + err.Error())
+		os.Exit(1)
+	}
 
 	var objectStore storage.ObjectStore
 	var proxy storage.ProxyVerifier
@@ -101,10 +107,10 @@ func main() {
 	groups := group.New(db, convs, contacts, nil, clk.Now)
 	messages := message.New(db, contacts, groupMessageAdapter{g: groups}, mediaSvc, convs, clk.Now)
 	groups.SetMessenger(messages)
-	moments := moment.New(db, contactMomentAdapter{c: contacts}, mediaSvc, nil, clk.Now)
+	moments := moment.New(db, contactMomentAdapter{c: contacts}, mediaSvc, outboxEmitter{}, clk.Now)
 	favorites := favorite.New(db, mediaSvc, nil, clk.Now)
 	backups := backup.New(db, backupSourcesStub{}, clk.Now)
-	contentSvc := content.New(db, operatorWhitelist{ids: cfg.Operator.IDs}, convs, nil, clk.Now)
+	contentSvc := content.New(db, operatorWhitelist{ids: cfg.Operator.IDs}, convs, outboxEmitter{}, clk.Now)
 	operatorSvc := operator.New(db, operatorWhitelist{ids: cfg.Operator.IDs}, clk.Now)
 
 	// Rate limits (SPEC-12 §7 default table, fail-open).
@@ -113,11 +119,22 @@ func main() {
 	chunkLimiter := ratelimit.New(cacheStore, "media_chunk", 600, time.Minute)
 	readLimiter := ratelimit.New(cacheStore, "read", 300, time.Minute)
 
+	var shuttingDown atomic.Bool
+	ready := func(ctx context.Context) error {
+		if shuttingDown.Load() {
+			return errors.New("server is shutting down")
+		}
+		if err := db.PingContext(ctx); err != nil {
+			return err
+		}
+		return cacheStore.Ping(ctx)
+	}
+
 	mux := buildRouter(routerServices{
 		auth: authSvc, devices: devices, users: users, contacts: contacts,
 		groups: groups, media: mediaSvc, messages: messages, moments: moments, favorites: favorites,
 		backups: backups, content: contentSvc, operator: operatorSvc,
-		authn: authSvc,
+		authn: authSvc, ready: ready, trustedProxies: cfg.HTTP.TrustedProxies,
 		limiters: limiters{auth: authLimiter, write: writeLimiter, chunk: chunkLimiter, read: readLimiter},
 	})
 
@@ -143,29 +160,34 @@ func main() {
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	<-sigCh
 	log.Info("shutting down")
+	shuttingDown.Store(true)
 
 	shutCtx, cancel := context.WithTimeout(ctx, cfg.HTTP.ShutdownTimeout)
 	defer cancel()
-	_ = srv.Shutdown(shutCtx)
+	if err := srv.Shutdown(shutCtx); err != nil {
+		log.Error("shutdown: " + err.Error())
+	}
 	log.Info("stopped")
 }
 
 // routerServices groups the handlers the route table needs.
 type routerServices struct {
-	auth     *auth.Service
-	devices  *device.Service
-	users    *user.Service
-	contacts *contact.Service
-	groups   *group.Service
-	media    *media.Service
-	messages *message.Service
-	moments  *moment.Service
-	favorites *favorite.Service
-	backups  *backup.Service
-	content  *content.Service
-	operator *operator.Service
-	authn    httpx.Authenticator
-	limiters limiters
+	auth           *auth.Service
+	devices        *device.Service
+	users          *user.Service
+	contacts       *contact.Service
+	groups         *group.Service
+	media          *media.Service
+	messages       *message.Service
+	moments        *moment.Service
+	favorites      *favorite.Service
+	backups        *backup.Service
+	content        *content.Service
+	operator       *operator.Service
+	authn          httpx.Authenticator
+	ready          func(context.Context) error
+	trustedProxies []string
+	limiters       limiters
 }
 
 type limiters struct {
@@ -182,6 +204,9 @@ type groupMessageAdapter struct{ g *group.Service }
 func (a groupMessageAdapter) CanSend(ctx context.Context, groupID, userID int64) error {
 	return a.g.CanSend(ctx, groupID, userID)
 }
+func (a groupMessageAdapter) CanSendTx(ctx context.Context, tx mysqlx.Tx, groupID, userID int64) error {
+	return a.g.CanSendTx(ctx, tx, groupID, userID)
+}
 func (a groupMessageAdapter) IsModerator(ctx context.Context, groupID, userID int64) (bool, error) {
 	return a.g.IsModerator(ctx, groupID, userID)
 }
@@ -196,6 +221,9 @@ func (a groupMessageAdapter) GroupByConversation(ctx context.Context, conversati
 }
 func (a groupMessageAdapter) WasMemberAt(ctx context.Context, groupID, userID int64, at time.Time) (bool, error) {
 	return a.g.WasMemberAt(ctx, groupID, userID, at)
+}
+func (a groupMessageAdapter) WasMemberAtMany(ctx context.Context, groupID, userID int64, ats []time.Time) ([]bool, error) {
+	return a.g.WasMemberAtMany(ctx, groupID, userID, ats)
 }
 func (a groupMessageAdapter) ListGroupConversationsForUser(ctx context.Context, userID int64) ([]message.GroupConvView, error) {
 	rows, err := a.g.ListGroupConversationsForUser(ctx, userID)
@@ -241,6 +269,14 @@ func (w operatorWhitelist) IsOperator(_ context.Context, userID int64) bool {
 
 // contactMomentAdapter adapts *contact.Service to the moment.Contact port.
 type contactMomentAdapter struct{ c *contact.Service }
+
+type outboxEmitter struct{}
+
+func (outboxEmitter) Emit(ctx context.Context, tx mysqlx.Tx, eventType string, aggregateID int64, queue string) error {
+	return outbox.Emit(ctx, tx, outbox.Event{
+		Type: eventType, AggregateID: strconv.FormatInt(aggregateID, 10), Queue: queue,
+	})
+}
 
 func (a contactMomentAdapter) ActiveFriendsWithEpoch(ctx context.Context, authorID int64) ([]moment.FriendEpoch, error) {
 	rows, err := a.c.ActiveFriendsWithEpoch(ctx, authorID)
@@ -328,8 +364,17 @@ func buildRouter(s routerServices) http.Handler {
 		_, _ = w.Write([]byte("ok"))
 	})
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
-		// Phase 1: process is ready if it can serve. A real DB ping belongs to
-		// the runtime module (task G) — keep the surface honest.
+		if s.ready != nil {
+			ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+			defer cancel()
+			if err := s.ready(ctx); err != nil {
+				httpx.JSON(w, r, http.StatusServiceUnavailable, map[string]string{
+					"status": "not_ready",
+					"error":  err.Error(),
+				})
+				return
+			}
+		}
 		httpx.JSON(w, r, http.StatusOK, map[string]string{"status": "ready"})
 	})
 
@@ -418,5 +463,5 @@ func buildRouter(s routerServices) http.Handler {
 	// The byte proxy is public: the signed token is the credential (R16).
 	mux.Handle("GET /api/v1/media/download", public(mediaH.Download))
 
-	return httpx.RequestID(httpx.Recover(mux))
+	return httpx.RequestID(httpx.Recover(httpx.ResolveClientIP(s.trustedProxies)(mux)))
 }

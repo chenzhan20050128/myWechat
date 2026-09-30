@@ -148,29 +148,33 @@ func (s *Service) PutChunk(ctx context.Context, owner int64, id string, n int, b
 // and — only when everything matches — commits the object row, the session
 // transition and the media.process event in one transaction (R6, §5).
 func (s *Service) CompleteUpload(ctx context.Context, owner int64, id string) (int64, error) {
-	row, err := s.sessionFor(ctx, owner, id)
+	assemblyOwner := ids.New()
+	var row SessionRow
+	alreadyCompleted := false
+	err := mysqlx.WithinTx(ctx, s.db, func(tx mysqlx.Tx) error {
+		var err error
+		row, alreadyCompleted, err = claimForAssembly(ctx, tx, owner, id, assemblyOwner, s.now.Now())
+		return err
+	})
 	if err != nil {
 		return 0, err
 	}
-	if row.Status == SessionCompleted {
+	if alreadyCompleted {
 		return row.MediaObjectID, nil
-	}
-	if row.Status != SessionOpen {
-		return 0, apperrors.Conflict("upload session is " + row.Status)
-	}
-	if !s.now.Now().Before(row.ExpiresAt) {
-		return 0, apperrors.Unavail("upload session expired")
 	}
 	missing, err := missingChunks(ctx, s.db, id, row.TotalChunks)
 	if err != nil {
+		_ = s.releaseAssembly(ctx, id, assemblyOwner)
 		return 0, err
 	}
 	if len(missing) > 0 {
+		_ = s.releaseAssembly(ctx, id, assemblyOwner)
 		return 0, apperrors.Conflict(fmt.Sprintf("missing chunks: %v", missing))
 	}
 
 	pending, err := s.verifyAssembly(ctx, row)
 	if err != nil {
+		_ = s.releaseAssembly(ctx, id, assemblyOwner)
 		return 0, err
 	}
 
@@ -186,7 +190,7 @@ func (s *Service) CompleteUpload(ctx context.Context, owner int64, id string) (i
 		if err != nil {
 			return err
 		}
-		won, err := completeSession(ctx, tx, id, objectID, s.now.Now())
+		won, err := completeSession(ctx, tx, id, assemblyOwner, objectID, s.now.Now())
 		if err != nil {
 			return err
 		}
@@ -204,10 +208,14 @@ func (s *Service) CompleteUpload(ctx context.Context, owner int64, id string) (i
 		if err != nil {
 			return 0, err
 		}
-		return current.MediaObjectID, nil
+		if current.Status == SessionCompleted {
+			return current.MediaObjectID, nil
+		}
+		return 0, apperrors.Conflict("upload session is " + current.Status)
 	}
 	if err != nil {
 		_ = s.store.Delete(ctx, pending.key)
+		_ = s.releaseAssembly(ctx, id, assemblyOwner)
 		return 0, err
 	}
 
@@ -215,6 +223,12 @@ func (s *Service) CompleteUpload(ctx context.Context, owner int64, id string) (i
 		_ = s.store.Delete(ctx, chunkKey(id, n))
 	}
 	return winner, nil
+}
+
+func (s *Service) releaseAssembly(ctx context.Context, id, assemblyOwner string) error {
+	return mysqlx.WithinTx(ctx, s.db, func(tx mysqlx.Tx) error {
+		return releaseAssembly(ctx, tx, id, assemblyOwner, s.now.Now())
+	})
 }
 
 // assembly is a verified blob waiting for its commit decision.
@@ -295,6 +309,9 @@ func (s *Service) ExpireUploads(ctx context.Context) (int, error) {
 		if err := mysqlx.WithinTx(ctx, s.db, func(tx mysqlx.Tx) error {
 			return closeSession(ctx, tx, id, SessionExpired, now)
 		}); err != nil {
+			if errors.Is(err, errSessionNotOpen) {
+				continue
+			}
 			return 0, err
 		}
 		for n := 1; n <= row.TotalChunks; n++ {
@@ -320,7 +337,14 @@ func (s *Service) DownloadURL(ctx context.Context, requester, objectID int64) (s
 		if err != nil {
 			return "", err
 		}
+		granted := false
 		if !avatar {
+			granted, err = hasActiveUserReference(ctx, s.db, objectID, requester)
+			if err != nil {
+				return "", err
+			}
+		}
+		if !avatar && !granted {
 			return "", apperrors.New(apperrors.Forbidden, "not allowed to download this object")
 		}
 	}
@@ -382,6 +406,31 @@ func (s *Service) BindAvatarTx(ctx context.Context, tx mysqlx.Tx, objectID, user
 // by kind (image/video/voice/file/thumb). Called by message on send pre-check (R7).
 func (s *Service) AssertReady(ctx context.Context, ownerID, objectID int64, kind string) error {
 	obj, err := findObject(ctx, s.db, objectID)
+	return assertObjectReady(obj, err, ownerID, kind)
+}
+
+// ProcessTx validates a media object after upload. Variant generation is not
+// implemented yet, but the consumer now owns a transactional hook and no event
+// is silently dropped.
+func (s *Service) ProcessTx(ctx context.Context, tx mysqlx.Tx, objectID int64) error {
+	obj, err := findObject(ctx, tx, objectID)
+	if err != nil {
+		return err
+	}
+	if obj.Status != ObjectReady {
+		return apperrors.New(apperrors.StateConflict, "media object is not ready")
+	}
+	return nil
+}
+
+// AssertReadyTx is the transactional form used by message send: the object row
+// is locked until the message transaction commits.
+func (s *Service) AssertReadyTx(ctx context.Context, tx mysqlx.Tx, ownerID, objectID int64, kind string) error {
+	obj, err := findObjectForUpdate(ctx, tx, objectID)
+	return assertObjectReady(obj, err, ownerID, kind)
+}
+
+func assertObjectReady(obj ObjectRow, err error, ownerID int64, kind string) error {
 	if err != nil {
 		return err
 	}
@@ -397,11 +446,139 @@ func (s *Service) AssertReady(ctx context.Context, ownerID, objectID int64, kind
 	return nil
 }
 
-// OnReferencesRemoved is invoked by the message retention worker when messages
-// referencing these objects expire (R26). V1: no-op GC hook; phase-3 wires the
-// GC queue. Signature kept stable so the message port does not change.
-func (s *Service) OnReferencesRemoved(ctx context.Context, objectIDs []int64) error {
+// BindMessageAssetTx records the durable business reference in the same
+// transaction as the message_assets row.
+func (s *Service) BindMessageAssetTx(ctx context.Context, tx mysqlx.Tx, messageID, objectID int64, participantIDs []int64) error {
+	refID, err := insertReference(ctx, tx, objectID, "message", strconv.FormatInt(messageID, 10), s.now.Now())
+	if err != nil {
+		return err
+	}
+	var ownerID int64
+	if err := tx.QueryRowContext(ctx, `SELECT owner_id FROM media_objects WHERE id = ?`, objectID).Scan(&ownerID); err != nil {
+		return err
+	}
+	if err := ensureUserReference(ctx, tx, objectID, ownerID, refID, s.now.Now()); err != nil {
+		return err
+	}
+	for _, userID := range participantIDs {
+		if err := ensureUserReference(ctx, tx, objectID, userID, refID, s.now.Now()); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// BindMomentAssetTx records the durable moment business reference in the same
+// transaction as the moment and its asset rows.
+func (s *Service) BindMomentAssetTx(ctx context.Context, tx mysqlx.Tx, momentID, objectID int64) error {
+	refID, err := insertReference(ctx, tx, objectID, "moment", strconv.FormatInt(momentID, 10), s.now.Now())
+	if err != nil {
+		return err
+	}
+	var ownerID int64
+	if err := tx.QueryRowContext(ctx, `SELECT owner_id FROM media_objects WHERE id = ?`, objectID).Scan(&ownerID); err != nil {
+		return err
+	}
+	return ensureUserReference(ctx, tx, objectID, ownerID, refID, s.now.Now())
+}
+
+// OnReferencesRemoved drains due durable GC tasks after message expiration.
+func (s *Service) OnReferencesRemoved(ctx context.Context, objectIDs []int64) error {
+	_, err := s.ProcessGCTasks(ctx, len(objectIDs))
+	return err
+}
+
+// EnqueueGCTx records objects whose business references were removed in the
+// caller's transaction. The task survives a crash between DB commit and GC.
+func (s *Service) EnqueueGCTx(ctx context.Context, tx mysqlx.Tx, objectIDs []int64, purgeAfter time.Time) error {
+	return enqueueGCTasks(ctx, tx, objectIDs, s.now.Now(), purgeAfter)
+}
+
+// ProcessGCTasks claims due GC rows, removes unreferenced bytes, and only then
+// marks the task done. A physical-delete crash retries after the lease expires.
+func (s *Service) ProcessGCTasks(ctx context.Context, batch int) (int, error) {
+	if batch <= 0 || batch > 1000 {
+		batch = 1000
+	}
+	ids, err := s.claimGCTasks(ctx, batch)
+	if err != nil {
+		return 0, err
+	}
+	processed := 0
+	for _, objectID := range ids {
+		var bucketKey string
+		shouldDelete := false
+		err := mysqlx.WithinTx(ctx, s.db, func(tx mysqlx.Tx) error {
+			obj, err := findObject(ctx, tx, objectID)
+			if err != nil {
+				return err
+			}
+			bucketKey = obj.BucketKey
+			refs, err := activeReferenceCount(ctx, tx, objectID)
+			if err != nil {
+				return err
+			}
+			if refs == 0 && obj.Status != ObjectDeleted {
+				if err := markObjectCleaned(ctx, tx, objectID, s.now.Now()); err != nil {
+					return err
+				}
+				shouldDelete = true
+			}
+			return nil
+		})
+		if err != nil {
+			return processed, err
+		}
+		if shouldDelete {
+			if err := s.store.Delete(ctx, bucketKey); err != nil {
+				return processed, err
+			}
+		}
+		if err := mysqlx.WithinTx(ctx, s.db, func(tx mysqlx.Tx) error {
+			return markGCTaskDone(ctx, tx, objectID, s.now.Now())
+		}); err != nil {
+			return processed, err
+		}
+		processed++
+	}
+	return processed, nil
+}
+
+func (s *Service) claimGCTasks(ctx context.Context, batch int) ([]int64, error) {
+	now := s.now.Now()
+	leaseUntil := now.Add(AssemblyLeaseTTL)
+	var ids []int64
+	err := mysqlx.WithinTx(ctx, s.db, func(tx mysqlx.Tx) error {
+		rows, err := tx.QueryContext(ctx, `
+			SELECT object_id FROM media_gc_tasks
+			WHERE purge_after <= ? AND (status = 'pending' OR (status = 'processing' AND lease_until < ?))
+			ORDER BY object_id LIMIT ? FOR UPDATE SKIP LOCKED`, now, now, batch)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				return err
+			}
+			ids = append(ids, id)
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		for _, id := range ids {
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE media_gc_tasks
+				SET status = 'processing', lease_until = ?, updated_at = ?
+				WHERE object_id = ? AND (status = 'pending' OR (status = 'processing' AND lease_until < ?))`,
+				leaseUntil, now, id, now); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return ids, err
 }
 
 // mimeMatches enforces the kind→mime table from SPEC-04 §3.

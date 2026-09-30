@@ -15,6 +15,7 @@ type Event struct {
 	AggregateID string `json:"aggregate_id"`
 	Version     int64  `json:"version"`
 	Attempt     int    `json:"attempt"`
+	Queue       string `json:"queue,omitempty"`
 }
 
 // Publisher dispatches already-committed outbox events.
@@ -24,11 +25,11 @@ type Publisher interface {
 
 // Fixed queue names (contract §12.5.3). Phase 2 consumers bind these.
 const (
-	QueueMessagePush   = "wechat.message.push"
-	QueueNotification  = "wechat.notification"
-	QueueMediaProcess  = "wechat.media.process"
-	QueueLifecycle     = "wechat.lifecycle"
-	QueueScheduler     = "wechat.scheduler"
+	QueueMessagePush    = "wechat.message.push"
+	QueueNotification   = "wechat.notification"
+	QueueMediaProcess   = "wechat.media.process"
+	QueueLifecycle      = "wechat.lifecycle"
+	QueueScheduler      = "wechat.scheduler"
 	QueueContentService = "wechat.content.service"
 )
 

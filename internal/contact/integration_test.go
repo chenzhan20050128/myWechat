@@ -4,9 +4,11 @@ package contact
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -69,7 +71,8 @@ func (e *env) newUser(t *testing.T) testUser { return e.newUserNamed(t, "") }
 
 func (e *env) newUserNamed(t *testing.T, nickname string) testUser {
 	t.Helper()
-	tag := fmt.Sprintf("%08d%04d", time.Now().UnixNano()%100000000, seq.Add(1))
+	random, _ := cryptorand.Int(cryptorand.Reader, big.NewInt(100000000))
+	tag := fmt.Sprintf("%08d%04d", random.Int64(), seq.Add(1))
 	u := testUser{
 		Phone:    "+86" + tag,
 		Account:  "u" + tag,

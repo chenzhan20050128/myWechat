@@ -7,6 +7,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+if ! command -v go >/dev/null 2>&1; then
+  echo "boundary check FAILED: go is not installed or not on PATH" >&2
+  exit 1
+fi
+
 MODULE="github.com/example/wechat"
 DOMAINS=(auth user device contact conversation media group message moment favorite backup content runtime operator ws audit)
 # future phases: content_account service_session notification operator
@@ -14,7 +19,7 @@ DOMAINS=(auth user device contact conversation media group message moment favori
 fail=0
 
 for p in $(go list ./internal/platform/...); do
-  deps=$(go list -deps "$p" 2>/dev/null | grep "^$MODULE/internal/" || true)
+  deps=$(go list -deps "$p" | grep "^$MODULE/internal/" || true)
   for d in $deps; do
     for dom in "${DOMAINS[@]}"; do
       if [[ "$d" == *"/internal/$dom"* || "$d" == "$MODULE/internal/$dom" ]]; then
@@ -27,8 +32,8 @@ done
 
 for src in "${DOMAINS[@]}"; do
   [ -d "internal/$src" ] || continue
-  for p in $(go list "./internal/$src/..." 2>/dev/null); do
-    deps=$(go list -deps "$p" 2>/dev/null | grep "^$MODULE/internal/" || true)
+  for p in $(go list "./internal/$src/..."); do
+    deps=$(go list -deps "$p" | grep "^$MODULE/internal/" || true)
     for d in $deps; do
       # skip self and platform
       [[ "$d" == "$MODULE/internal/$src"* || "$d" == "$MODULE/internal/platform"* ]] && continue

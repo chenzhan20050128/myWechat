@@ -6,7 +6,10 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"net"
 	"net/http"
+	"net/netip"
+	"strings"
 
 	apperrors "github.com/example/wechat/internal/platform/errors"
 	"github.com/example/wechat/internal/platform/ids"
@@ -21,6 +24,7 @@ type Envelope struct {
 }
 
 type requestIDKey struct{}
+type clientIPKey struct{}
 
 // RequestID middleware: generate (or propagate) a request id (R7).
 func RequestID(next http.Handler) http.Handler {
@@ -73,13 +77,87 @@ func write(w http.ResponseWriter, _ *http.Request, status int, env Envelope) {
 	_ = json.NewEncoder(w).Encode(env)
 }
 
-// ClientIP returns the caller address for audit records. Behind the gateway
-// the real address arrives in X-Forwarded-For.
+// ResolveClientIP stores the caller IP after applying the trusted proxy policy.
+// X-Forwarded-For is ignored unless the direct peer is explicitly trusted.
+func ResolveClientIP(trusted []string) func(http.Handler) http.Handler {
+	prefixes := parseTrustedPrefixes(trusted)
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ip := remoteIP(r.RemoteAddr)
+			if ip.IsValid() && trustedIP(prefixes, ip) {
+				if resolved, ok := forwardedClientIP(r.Header.Get("X-Forwarded-For"), prefixes); ok {
+					ip = resolved
+				}
+			}
+			value := ""
+			if ip.IsValid() {
+				value = ip.String()
+			}
+			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), clientIPKey{}, value)))
+		})
+	}
+}
+
+// ClientIP returns the caller address for audit and rate-limit keys.
 func ClientIP(r *http.Request) string {
-	if v := r.Header.Get("X-Forwarded-For"); v != "" {
+	if v, ok := r.Context().Value(clientIPKey{}).(string); ok && v != "" {
 		return v
 	}
+	if ip := remoteIP(r.RemoteAddr); ip.IsValid() {
+		return ip.String()
+	}
 	return r.RemoteAddr
+}
+
+func parseTrustedPrefixes(values []string) []netip.Prefix {
+	out := make([]netip.Prefix, 0, len(values))
+	for _, value := range values {
+		if prefix, err := netip.ParsePrefix(value); err == nil {
+			out = append(out, prefix)
+			continue
+		}
+		if addr, err := netip.ParseAddr(value); err == nil {
+			addr = addr.Unmap()
+			out = append(out, netip.PrefixFrom(addr, addr.BitLen()))
+		}
+	}
+	return out
+}
+
+func remoteIP(remoteAddr string) netip.Addr {
+	host := remoteAddr
+	if value, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		host = value
+	}
+	addr, err := netip.ParseAddr(strings.TrimSpace(host))
+	if err != nil {
+		return netip.Addr{}
+	}
+	return addr.Unmap()
+}
+
+func trustedIP(prefixes []netip.Prefix, addr netip.Addr) bool {
+	for _, prefix := range prefixes {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+func forwardedClientIP(header string, trusted []netip.Prefix) (netip.Addr, bool) {
+	parts := strings.Split(header, ",")
+	for i := len(parts) - 1; i >= 0; i-- {
+		addr, err := netip.ParseAddr(strings.TrimSpace(parts[i]))
+		if err != nil {
+			continue
+		}
+		addr = addr.Unmap()
+		if !trustedIP(trusted, addr) {
+			return addr, true
+		}
+	}
+	return netip.Addr{}, false
 }
 
 // GetRequestID returns the id set by the RequestID middleware.

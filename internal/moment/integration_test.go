@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -55,12 +56,15 @@ func (f *fakeContact) ExpandTag(_ context.Context, ownerID, tagID int64) ([]Frie
 type fakeMedia struct{}
 
 func (fakeMedia) AssertReady(_ context.Context, _, _ int64, _ string) error { return nil }
+func (fakeMedia) BindMomentAssetTx(_ context.Context, _ mysqlx.Tx, _, _ int64) error {
+	return nil
+}
 
 type env struct {
-	db    *sql.DB
-	svc   *Service
-	fake  *fakeContact
-	clk   *clock.Fake
+	db   *sql.DB
+	svc  *Service
+	fake *fakeContact
+	clk  *clock.Fake
 }
 
 func newEnv(t *testing.T) *env {
@@ -506,5 +510,91 @@ func TestT21_LikesDisabled(t *testing.T) {
 		t.Fatal("likes should be disabled")
 	} else if appErr := apperrors.AsApp(err); appErr == nil || appErr.Code != apperrors.InvalidArgument {
 		t.Fatalf("expected InvalidArgument, got %v", err)
+	}
+}
+
+func TestConcurrentLikesNotifyOnce(t *testing.T) {
+	e := newEnv(t)
+	author, viewer := e.newUser(t), e.newUser(t)
+	e.makeFriend(author, viewer)
+	mid, err := e.svc.Publish(context.Background(), &PublishInput{
+		AuthorID: author, Content: "like race", Visibility: VisAllFriends,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const likers = 20
+	errs := make([]error, likers)
+	var wg sync.WaitGroup
+	for i := 0; i < likers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = e.svc.Like(context.Background(), mid, viewer)
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("like %d: %v", i, err)
+		}
+	}
+	var n int
+	if err := e.db.QueryRowContext(context.Background(), `
+		SELECT COUNT(*) FROM moment_notifications
+		WHERE recipient_id = ? AND moment_id = ? AND kind = 'like' AND actor_id = ?`,
+		author, mid, viewer).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("like notifications = %d, want 1", n)
+	}
+}
+
+func TestConcurrentScheduleWorkersPublishOnce(t *testing.T) {
+	e := newEnv(t)
+	author := e.newUser(t)
+	runAt := e.clk.Now().Add(time.Second)
+	sid, err := e.svc.CreateSchedule(context.Background(), &PublishInput{
+		AuthorID: author, Content: "scheduled", Visibility: VisSelf,
+	}, runAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.clk.Advance(2 * time.Second)
+
+	const workers = 2
+	errs := make([]error, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = e.svc.PublishDueSchedules(context.Background(), fmt.Sprintf("worker-%d", i))
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("worker %d: %v", i, err)
+		}
+	}
+	var moments int
+	if err := e.db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM moments WHERE author_id = ? AND content = 'scheduled'`, author).Scan(&moments); err != nil {
+		t.Fatal(err)
+	}
+	if moments != 1 {
+		t.Fatalf("published moments = %d, want 1", moments)
+	}
+	var status string
+	var momentID sql.NullInt64
+	if err := e.db.QueryRowContext(context.Background(),
+		`SELECT status, moment_id FROM moment_schedules WHERE id = ?`, sid).Scan(&status, &momentID); err != nil {
+		t.Fatal(err)
+	}
+	if status != SchedPublished || !momentID.Valid {
+		t.Fatalf("schedule status=%s moment=%v", status, momentID)
 	}
 }

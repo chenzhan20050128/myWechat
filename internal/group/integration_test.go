@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -407,7 +408,7 @@ func TestT18CreateTodoAndAssigneeCompletion(t *testing.T) {
 		t.Fatal(err)
 	}
 	tid, err := e.svc.CreateTodo(context.Background(), gid, owner, CreateTodoInput{
-		Title:      "pickup milk",
+		Title:       "pickup milk",
 		AssigneeIDs: []int64{assignee},
 	})
 	if err != nil {
@@ -515,5 +516,59 @@ func TestT22ListMyGroups(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected group %d in %+v", gid, groups)
+	}
+}
+
+func TestConcurrentJoinsHonorInviteUseLimit(t *testing.T) {
+	e := newEnv(t)
+	owner := e.newUser(t)
+	gid := e.newGroup(t, owner)
+	code, _, err := e.svc.NewInviteCode(context.Background(), gid, owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.ExecContext(context.Background(),
+		`UPDATE group_invite_codes SET max_uses = 2 WHERE group_id = ? AND code = ?`, gid, code); err != nil {
+		t.Fatal(err)
+	}
+
+	const candidates = 8
+	ids := make([]int64, candidates)
+	errs := make([]error, candidates)
+	var wg sync.WaitGroup
+	for i := 0; i < candidates; i++ {
+		ids[i] = e.newUser(t)
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = e.svc.Join(context.Background(), ids[i], code)
+		}(i)
+	}
+	wg.Wait()
+
+	successes := 0
+	for i, err := range errs {
+		if err == nil {
+			successes++
+			continue
+		}
+		if ae := apperrors.AsApp(err); ae == nil || ae.Code != apperrors.ResourceUnavailable {
+			t.Fatalf("candidate %d: unexpected error %v", i, err)
+		}
+	}
+	if successes != 2 {
+		t.Fatalf("successful joins = %d, want 2", successes)
+	}
+	var members, uses int
+	if err := e.db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM group_members WHERE group_id = ? AND left_at IS NULL`, gid).Scan(&members); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.db.QueryRowContext(context.Background(),
+		`SELECT use_count FROM group_invite_codes WHERE group_id = ? AND code = ?`, gid, code).Scan(&uses); err != nil {
+		t.Fatal(err)
+	}
+	if members != 3 || uses != 2 {
+		t.Fatalf("members=%d invite uses=%d, want 3/2", members, uses)
 	}
 }

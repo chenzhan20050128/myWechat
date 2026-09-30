@@ -4,10 +4,13 @@ package content
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -35,7 +38,7 @@ type env struct {
 
 type fakeClock struct{ t time.Time }
 
-func (c *fakeClock) Now() time.Time { return c.t }
+func (c *fakeClock) Now() time.Time          { return c.t }
 func (c *fakeClock) Advance(d time.Duration) { c.t = c.t.Add(d) }
 
 func newEnv(t *testing.T, operatorIDs map[int64]bool) *env {
@@ -59,7 +62,8 @@ var userSeq atomic.Int64
 
 func (e *env) newUser(t *testing.T) int64 {
 	t.Helper()
-	phone := fmt.Sprintf("+86%08d%04d", time.Now().UnixNano()%100000000, userSeq.Add(1))
+	random, _ := cryptorand.Int(cryptorand.Reader, big.NewInt(100000000))
+	phone := fmt.Sprintf("+86%08d%04d", random.Int64(), userSeq.Add(1))
 	account := "u" + phone[3:]
 	res, err := e.db.ExecContext(context.Background(),
 		`INSERT INTO users (phone, account_name, password_hash, created_at, updated_at)
@@ -490,6 +494,46 @@ func TestT16_NonOperator(t *testing.T) {
 	})
 	if !isCode(err, apperrors.Forbidden) {
 		t.Fatalf("expected forbidden, got %v", err)
+	}
+}
+
+func TestConcurrentStartSessionIsIdempotent(t *testing.T) {
+	e := newEnv(t, map[int64]bool{1: true})
+	accountID := e.newAccount(t, 1)
+	e.activate(t, 1, accountID)
+	userID := e.newUser(t)
+	if err := e.svc.Follow(context.Background(), accountID, userID); err != nil {
+		t.Fatal(err)
+	}
+
+	const starters = 12
+	results := make([]*StartSessionResult, starters)
+	errs := make([]error, starters)
+	var wg sync.WaitGroup
+	for i := 0; i < starters; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i], errs[i] = e.svc.StartSession(context.Background(), accountID, userID)
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("starter %d: %v", i, err)
+		}
+		if results[i].ID != results[0].ID || results[i].Number != results[0].Number {
+			t.Fatalf("starter %d got %+v, want %+v", i, results[i], results[0])
+		}
+	}
+	var sessions int
+	if err := e.db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM service_sessions WHERE official_account_id = ? AND user_id = ?`,
+		accountID, userID).Scan(&sessions); err != nil {
+		t.Fatal(err)
+	}
+	if sessions != 1 {
+		t.Fatalf("sessions = %d, want 1", sessions)
 	}
 }
 

@@ -19,7 +19,7 @@ import (
 
 type fakeClock struct{ t time.Time }
 
-func (c *fakeClock) Now() time.Time { return c.t }
+func (c *fakeClock) Now() time.Time          { return c.t }
 func (c *fakeClock) Advance(d time.Duration) { c.t = c.t.Add(d) }
 
 type fakePublisher struct {
@@ -45,9 +45,9 @@ func (f *fakePublisher) count() int {
 }
 
 type env struct {
-	db   *sql.DB
-	clk  *fakeClock
-	pub  *fakePublisher
+	db    *sql.DB
+	clk   *fakeClock
+	pub   *fakePublisher
 	relay *Relay
 }
 
@@ -113,19 +113,22 @@ func TestT1_RelayPublishFlow(t *testing.T) {
 	}
 }
 
-// T2: failed publish marks failed but does not block the next batch.
+// T2: failed publish schedules a retry and does not block the next batch.
 func TestT2_FailedPublish(t *testing.T) {
 	e := newEnv(t)
 	e.pub.fail = errors.New("broker down")
 	ids := e.insertPending(t, 1)
 	_, _ = e.relay.RunOnce(context.Background())
 	var status string
+	var owner string
+	var attempt int
 	if err := e.db.QueryRowContext(context.Background(),
-		`SELECT status FROM outbox_events WHERE event_id = ?`, ids[0]).Scan(&status); err != nil {
+		`SELECT status, lease_owner, attempt FROM outbox_events WHERE event_id = ?`, ids[0]).
+		Scan(&status, &owner, &attempt); err != nil {
 		t.Fatal(err)
 	}
-	if status != "failed" {
-		t.Fatalf("expected failed, got %s", status)
+	if status != "publishing" || owner != "retry:test-relay" || attempt != 1 {
+		t.Fatalf("retry status=%s owner=%s attempt=%d, want publishing retry:test-relay 1", status, owner, attempt)
 	}
 }
 
@@ -246,5 +249,97 @@ func TestT7_LifecycleRunner(t *testing.T) {
 	}
 	if calls != 2 {
 		t.Fatalf("expected 2 calls, got %d", calls)
+	}
+}
+
+func TestDispatchTxRollsBackHandlerSideEffectOnRetry(t *testing.T) {
+	e := newEnv(t)
+	c := NewInbox(e.db, "savepoint-consumer", func(err error) FailureClass { return Transient }, e.clk.Now)
+	ev := mq.Event{EventID: ids.New(), Type: "message.stored", AggregateID: "99", Version: 7}
+	writeAudit := func(ctx context.Context, tx mysqlx.Tx, ev mq.Event) error {
+		_, err := tx.ExecContext(ctx, `
+			INSERT INTO audit_logs (event_type, actor_id, actor_ip, detail, created_at)
+			VALUES (?, 999999, '127.0.0.1', '{}', ?)`, ev.EventID, e.clk.Now())
+		return err
+	}
+	t.Cleanup(func() {
+		_, _ = e.db.ExecContext(context.Background(),
+			`DELETE FROM audit_logs WHERE event_type = ?`, ev.EventID)
+		_, _ = e.db.ExecContext(context.Background(),
+			`DELETE FROM inbox_events WHERE consumer_name = ? AND event_id = ?`, c.consumerName, ev.EventID)
+		_, _ = e.db.ExecContext(context.Background(),
+			`DELETE FROM async_retry_tasks WHERE consumer_name = ? AND event_id = ?`, c.consumerName, ev.EventID)
+	})
+
+	outcome, err := c.DispatchTxDetailed(context.Background(), ev, func(ctx context.Context, tx mysqlx.Tx, ev mq.Event) error {
+		if err := writeAudit(ctx, tx, ev); err != nil {
+			return err
+		}
+		return errors.New("business side effect failed")
+	})
+	if err != nil || outcome != OutcomeRetried {
+		t.Fatalf("outcome=%v err=%v, want retried/no error", outcome, err)
+	}
+	var auditRows int
+	if err := e.db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM audit_logs WHERE event_type = ?`, ev.EventID).Scan(&auditRows); err != nil {
+		t.Fatal(err)
+	}
+	if auditRows != 0 {
+		t.Fatalf("failed handler committed %d side-effect rows", auditRows)
+	}
+
+	outcome, err = c.DispatchTxDetailed(context.Background(), ev, func(ctx context.Context, tx mysqlx.Tx, ev mq.Event) error {
+		return writeAudit(ctx, tx, ev)
+	})
+	if err != nil || outcome != OutcomeProcessed {
+		t.Fatalf("retry outcome=%v err=%v", outcome, err)
+	}
+	if err := e.db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM audit_logs WHERE event_type = ?`, ev.EventID).Scan(&auditRows); err != nil {
+		t.Fatal(err)
+	}
+	if auditRows != 1 {
+		t.Fatalf("successful handler rows = %d, want 1", auditRows)
+	}
+}
+
+func TestLeaseDueRetriesRestoresEnvelope(t *testing.T) {
+	e := newEnv(t)
+	c := NewInbox(e.db, "retry-envelope", func(err error) FailureClass { return Transient }, e.clk.Now)
+	ev := mq.Event{
+		EventID: ids.New(), Type: "media.process", AggregateID: "123", Version: 9, Queue: "wechat.media.process",
+	}
+	t.Cleanup(func() {
+		_, _ = e.db.ExecContext(context.Background(),
+			`DELETE FROM inbox_events WHERE consumer_name = ? AND event_id = ?`, c.consumerName, ev.EventID)
+		_, _ = e.db.ExecContext(context.Background(),
+			`DELETE FROM async_retry_tasks WHERE consumer_name = ? AND event_id = ?`, c.consumerName, ev.EventID)
+	})
+	if err := c.Dispatch(context.Background(), ev, func(context.Context, mq.Event) error {
+		return errors.New("temporary failure")
+	}); err != nil {
+		t.Fatal(err)
+	}
+	e.clk.Advance(time.Minute)
+	events, queues, err := c.LeaseDueRetries(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := -1
+	for i, got := range events {
+		if got.EventID == ev.EventID {
+			found = i
+		}
+	}
+	if found < 0 {
+		t.Fatal("due retry event was not leased")
+	}
+	got := events[found]
+	if got.Type != ev.Type || got.AggregateID != ev.AggregateID || got.Version != ev.Version || got.Attempt != 1 {
+		t.Fatalf("restored event = %+v, want %+v with attempt 1", got, ev)
+	}
+	if queues[found] != ev.Queue {
+		t.Fatalf("queue = %q, want %q", queues[found], ev.Queue)
 	}
 }

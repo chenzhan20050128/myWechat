@@ -33,6 +33,7 @@ type Session struct {
 	PrevRefreshHash    string // rotated-out hash, for reuse detection (D2)
 	RefreshExpiresAt   time.Time
 	MustChangePassword bool
+	Revoked            bool
 }
 
 // Device aggregates the registry row (for the device list view).
@@ -135,7 +136,7 @@ func (s *Service) FindByAccessHash(ctx context.Context, hash string) (Session, e
 func (s *Service) FindByRefreshHash(ctx context.Context, hash string) (Session, bool, error) {
 	var sess Session
 	var prev sql.NullString
-	var mustChange, revoked int
+	var mustChange int
 	var revokedAt sql.NullTime
 	err := s.db.QueryRowContext(ctx, `
 		SELECT s.id, s.user_id, s.device_id, s.access_token_hash, s.access_expires_at,
@@ -152,9 +153,9 @@ func (s *Service) FindByRefreshHash(ctx context.Context, hash string) (Session, 
 	if err != nil {
 		return Session{}, false, fmt.Errorf("device: find by refresh: %w", err)
 	}
-	_ = revoked
 	sess.PrevRefreshHash = prev.String
 	sess.MustChangePassword = mustChange == 1
+	sess.Revoked = revokedAt.Valid
 	reused := sess.RefreshTokenHash != hash // matched only via prev hash
 	return sess, reused, nil
 }

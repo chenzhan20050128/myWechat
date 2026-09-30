@@ -365,13 +365,3 @@ func countActiveRefsForObject(ctx context.Context, db mysqlx.DBTX, objectID int6
 	err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM media_user_references WHERE object_id = ? AND revoked_at IS NULL`, objectID).Scan(&n)
 	return n, err
 }
-
-// enqueueGC inserts into media_gc_queue (INSERT IGNORE, I3).
-func enqueueGC(ctx context.Context, tx mysqlx.Tx, objectID int64, now time.Time) error {
-	purgeAfter := now.AddDate(0, 0, GCRetentionDays)
-	_, err := tx.ExecContext(ctx, `
-		INSERT IGNORE INTO media_gc_queue (media_object_id, enqueued_at, purge_after, state) VALUES (?, ?, ?, 'queued')`,
-		objectID, now, purgeAfter)
-	return err
-}
-

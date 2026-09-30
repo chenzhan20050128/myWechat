@@ -47,8 +47,8 @@ func (s *Service) SetMessenger(m SystemMessenger) { s.msg = m }
 
 // CreateInput is the POST /groups body.
 type CreateInput struct {
-	Name           string
-	AvatarMediaID  int64
+	Name          string
+	AvatarMediaID int64
 }
 
 // CreateGroup builds a group (R1).
@@ -73,7 +73,9 @@ func (s *Service) CreateGroup(ctx context.Context, creator int64, in CreateInput
 		if _, err := insertMember(ctx, tx, id, creator, RoleOwner, now); err != nil {
 			return err
 		}
-		_ = s.system(ctx, tx, convID, "group.created", map[string]any{"group_id": id})
+		if err := s.system(ctx, tx, convID, "group.created", map[string]any{"group_id": id}); err != nil {
+			return err
+		}
 		return insertGroupEvent(ctx, tx, id, "group.created", creator, 0, map[string]any{}, now)
 	})
 	if err != nil {
@@ -175,7 +177,9 @@ func (s *Service) SetAnnouncement(ctx context.Context, groupID, userID int64, co
 		if err := updateAnnouncement(ctx, tx, groupID, content, userID, now); err != nil {
 			return err
 		}
-		_ = s.system(ctx, tx, g.ConversationID, "announcement.changed", map[string]any{"by": userID})
+		if err := s.system(ctx, tx, g.ConversationID, "announcement.changed", map[string]any{"by": userID}); err != nil {
+			return err
+		}
 		return insertGroupEvent(ctx, tx, groupID, "announcement.changed", userID, 0, nil, now)
 	})
 }
@@ -225,11 +229,15 @@ func (s *Service) Invite(ctx context.Context, groupID, inviter int64, invitees [
 			if err := bumpMemberCount(ctx, tx, groupID, len(added)); err != nil {
 				return err
 			}
-			_ = s.system(ctx, tx, g.ConversationID, "member.joined", map[string]any{
+			if err := s.system(ctx, tx, g.ConversationID, "member.joined", map[string]any{
 				"by": inviter, "members": added,
-			})
+			}); err != nil {
+				return err
+			}
 			for _, uid := range added {
-				_ = insertGroupEvent(ctx, tx, groupID, "member.joined", inviter, uid, nil, s.now())
+				if err := insertGroupEvent(ctx, tx, groupID, "member.joined", inviter, uid, nil, s.now()); err != nil {
+					return err
+				}
 			}
 		}
 		return nil
@@ -283,8 +291,12 @@ func (s *Service) Join(ctx context.Context, userID int64, code string) (int64, e
 		if err := bumpMemberCount(ctx, tx, g.ID, 1); err != nil {
 			return err
 		}
-		_ = s.system(ctx, tx, g.ConversationID, "member.joined", map[string]any{"by": userID, "members": []int64{userID}})
-		_ = insertGroupEvent(ctx, tx, g.ID, "member.joined", userID, userID, nil, now)
+		if err := s.system(ctx, tx, g.ConversationID, "member.joined", map[string]any{"by": userID, "members": []int64{userID}}); err != nil {
+			return err
+		}
+		if err := insertGroupEvent(ctx, tx, g.ID, "member.joined", userID, userID, nil, now); err != nil {
+			return err
+		}
 		groupID = g.ID
 		return nil
 	})
@@ -321,9 +333,15 @@ func (s *Service) Quit(ctx context.Context, groupID, userID int64) error {
 				}
 			}
 		}
-		_ = bumpMemberCount(ctx, tx, groupID, -1)
-		_ = insertGroupEvent(ctx, tx, groupID, "member.quit", userID, userID, nil, s.now())
-		_ = s.system(ctx, tx, g.ConversationID, "member.quit", map[string]any{"user_id": userID})
+		if err := bumpMemberCount(ctx, tx, groupID, -1); err != nil {
+			return err
+		}
+		if err := insertGroupEvent(ctx, tx, groupID, "member.quit", userID, userID, nil, s.now()); err != nil {
+			return err
+		}
+		if err := s.system(ctx, tx, g.ConversationID, "member.quit", map[string]any{"user_id": userID}); err != nil {
+			return err
+		}
 		return nil
 	})
 }
@@ -338,7 +356,7 @@ func (s *Service) Kick(ctx context.Context, groupID, actor, target int64) error 
 		if actor == target {
 			return apperrors.Invalid("cannot kick yourself")
 		}
-		tm, role, err := activeMember(ctx, tx, groupID, target)
+		_, role, err := activeMember(ctx, tx, groupID, target)
 		if err != nil || role == "" {
 			return apperrors.Unavail("member not found")
 		}
@@ -364,10 +382,15 @@ func (s *Service) Kick(ctx context.Context, groupID, actor, target int64) error 
 				}
 			}
 		}
-		_ = bumpMemberCount(ctx, tx, groupID, -1)
-		_ = insertGroupEvent(ctx, tx, groupID, "member.removed", actor, target, nil, s.now())
-		_ = s.system(ctx, tx, g.ConversationID, "member.removed", map[string]any{"by": actor, "user_id": target})
-		_ = tm
+		if err := bumpMemberCount(ctx, tx, groupID, -1); err != nil {
+			return err
+		}
+		if err := insertGroupEvent(ctx, tx, groupID, "member.removed", actor, target, nil, s.now()); err != nil {
+			return err
+		}
+		if err := s.system(ctx, tx, g.ConversationID, "member.removed", map[string]any{"by": actor, "user_id": target}); err != nil {
+			return err
+		}
 		return nil
 	})
 }
@@ -385,8 +408,12 @@ func (s *Service) Transfer(ctx context.Context, groupID, actor, newOwner int64) 
 		if err := transferOwnership(ctx, tx, groupID, newOwner); err != nil {
 			return err
 		}
-		_ = insertGroupEvent(ctx, tx, groupID, "owner.transferred", actor, newOwner, nil, s.now())
-		_ = s.system(ctx, tx, g.ConversationID, "owner.transferred", map[string]any{"by": actor, "to": newOwner})
+		if err := insertGroupEvent(ctx, tx, groupID, "owner.transferred", actor, newOwner, nil, s.now()); err != nil {
+			return err
+		}
+		if err := s.system(ctx, tx, g.ConversationID, "owner.transferred", map[string]any{"by": actor, "to": newOwner}); err != nil {
+			return err
+		}
 		return nil
 	})
 }
@@ -401,8 +428,12 @@ func (s *Service) Dissolve(ctx context.Context, groupID, actor int64) error {
 		if err := dissolveGroup(ctx, tx, groupID, s.now()); err != nil {
 			return err
 		}
-		_ = insertGroupEvent(ctx, tx, groupID, "dissolved", actor, 0, nil, s.now())
-		_ = s.system(ctx, tx, g.ConversationID, "group.dissolved", map[string]any{"by": actor})
+		if err := insertGroupEvent(ctx, tx, groupID, "dissolved", actor, 0, nil, s.now()); err != nil {
+			return err
+		}
+		if err := s.system(ctx, tx, g.ConversationID, "group.dissolved", map[string]any{"by": actor}); err != nil {
+			return err
+		}
 		return nil
 	})
 }
@@ -470,8 +501,12 @@ func (s *Service) SetMute(ctx context.Context, groupID, actor, target int64, dur
 		if err := upsertMute(ctx, tx, groupID, target, actor, until, s.now()); err != nil {
 			return err
 		}
-		_ = insertGroupEvent(ctx, tx, groupID, "muted", actor, target, map[string]any{"duration": duration}, s.now())
-		_ = s.system(ctx, tx, g.ConversationID, "member.muted", map[string]any{"by": actor, "user_id": target})
+		if err := insertGroupEvent(ctx, tx, groupID, "muted", actor, target, map[string]any{"duration": duration}, s.now()); err != nil {
+			return err
+		}
+		if err := s.system(ctx, tx, g.ConversationID, "member.muted", map[string]any{"by": actor, "user_id": target}); err != nil {
+			return err
+		}
 		return nil
 	})
 }
@@ -486,8 +521,12 @@ func (s *Service) Unmute(ctx context.Context, groupID, actor, target int64) erro
 		if _, err := deleteMute(ctx, tx, groupID, target); err != nil {
 			return err
 		}
-		_ = insertGroupEvent(ctx, tx, groupID, "unmuted", actor, target, nil, s.now())
-		_ = s.system(ctx, tx, g.ConversationID, "member.unmuted", map[string]any{"by": actor, "user_id": target})
+		if err := insertGroupEvent(ctx, tx, groupID, "unmuted", actor, target, nil, s.now()); err != nil {
+			return err
+		}
+		if err := s.system(ctx, tx, g.ConversationID, "member.unmuted", map[string]any{"by": actor, "user_id": target}); err != nil {
+			return err
+		}
 		return nil
 	})
 }
@@ -517,14 +556,39 @@ func (s *Service) NewInviteCode(ctx context.Context, groupID, actor int64) (stri
 
 // CanSend implements the message-side GroupAuth port (R15/R16).
 func (s *Service) CanSend(ctx context.Context, groupID, userID int64) error {
-	m, role, err := activeMember(ctx, s.db, groupID, userID)
+	return s.canSend(ctx, s.db, groupID, userID)
+}
+
+// CanSendTx performs the send authorization inside the caller's transaction
+// while holding the group row lock, so membership and mute changes serialize
+// with message insertion.
+func (s *Service) CanSendTx(ctx context.Context, tx mysqlx.Tx, groupID, userID int64) error {
+	g, err := lockGroup(ctx, tx, groupID)
+	if err != nil {
+		return err
+	}
+	if g.Status != StatusActive {
+		return apperrors.New(apperrors.StateConflict, "group is dissolved")
+	}
+	m, role, err := activeMember(ctx, tx, groupID, userID)
 	if err != nil {
 		return err
 	}
 	if role == "" {
 		return apperrors.New(apperrors.Forbidden, "not a member")
 	}
-	g, err := findGroup(ctx, s.db, groupID)
+	return canSend(m.Role, m.MutedUntil, s.now())
+}
+
+func (s *Service) canSend(ctx context.Context, db mysqlx.DBTX, groupID, userID int64) error {
+	m, role, err := activeMember(ctx, db, groupID, userID)
+	if err != nil {
+		return err
+	}
+	if role == "" {
+		return apperrors.New(apperrors.Forbidden, "not a member")
+	}
+	g, err := findGroup(ctx, db, groupID)
 	if err != nil {
 		return err
 	}
@@ -579,6 +643,11 @@ func (s *Service) WasMemberAt(ctx context.Context, groupID, userID int64, at tim
 	return wasMemberAt(ctx, s.db, groupID, userID, at)
 }
 
+// WasMemberAtMany answers a page of membership questions with one query.
+func (s *Service) WasMemberAtMany(ctx context.Context, groupID, userID int64, ats []time.Time) ([]bool, error) {
+	return wasMemberAtMany(ctx, s.db, groupID, userID, ats)
+}
+
 // ListGroupConversationsForUser backs the A3 conversation list for group rows (R19).
 func (s *Service) ListGroupConversationsForUser(ctx context.Context, userID int64) ([]GroupConvView, error) {
 	return listGroupConversationsForUser(ctx, s.db, userID)
@@ -620,7 +689,6 @@ func (s *Service) CreateTodo(ctx context.Context, groupID, actor int64, in Creat
 		if err != nil {
 			return err
 		}
-		_ = tid
 		id = tid
 		if err := snapshotMembers(ctx, tx, tid, groupID); err != nil {
 			return err
@@ -640,8 +708,7 @@ func (s *Service) CreateTodo(ctx context.Context, groupID, actor int64, in Creat
 		if err != nil {
 			return err
 		}
-		_ = s.system(ctx, tx, g.ConversationID, "todo.created", map[string]any{"todo_id": tid, "group_id": groupID})
-		return nil
+		return s.system(ctx, tx, g.ConversationID, "todo.created", map[string]any{"todo_id": tid, "group_id": groupID})
 	})
 	return id, err
 }

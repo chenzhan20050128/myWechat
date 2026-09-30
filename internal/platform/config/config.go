@@ -4,6 +4,7 @@ package config
 
 import (
 	"fmt"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -42,6 +43,7 @@ type HTTP struct {
 	ReadTimeout     time.Duration
 	WriteTimeout    time.Duration
 	ShutdownTimeout time.Duration
+	TrustedProxies  []string
 }
 
 type MySQL struct {
@@ -77,14 +79,14 @@ type MQ struct {
 }
 
 type Auth struct {
-	AccessTTL       time.Duration
-	RefreshTTL      time.Duration
-	LoginMaxFails   int
-	LoginFreeze     time.Duration
-	ArgonTime       uint32
-	ArgonMemoryKiB  uint32
-	ArgonThreads    uint8
-	ArgonKeyLen     uint32
+	AccessTTL      time.Duration
+	RefreshTTL     time.Duration
+	LoginMaxFails  int
+	LoginFreeze    time.Duration
+	ArgonTime      uint32
+	ArgonMemoryKiB uint32
+	ArgonThreads   uint8
+	ArgonKeyLen    uint32
 	// DownloadURLTTL bounds how long a signed download URL stays valid (R14).
 	DownloadURLTTL time.Duration
 }
@@ -102,6 +104,7 @@ func Load() (*Config, error) {
 			ReadTimeout:     envDur("WECHAT_HTTP_READ_TIMEOUT", 15*time.Second),
 			WriteTimeout:    envDur("WECHAT_HTTP_WRITE_TIMEOUT", 30*time.Second),
 			ShutdownTimeout: envDur("WECHAT_HTTP_SHUTDOWN_TIMEOUT", 10*time.Second),
+			TrustedProxies:  csv(env("WECHAT_TRUSTED_PROXIES", "")),
 		},
 		MySQL: MySQL{
 			DSN:             os.Getenv("WECHAT_MYSQL_DSN"),
@@ -115,13 +118,13 @@ func Load() (*Config, error) {
 			RedisDB:   envInt("WECHAT_REDIS_DB", 0),
 		},
 		Storage: Storage{
-			Driver:     env("WECHAT_STORAGE_DRIVER", "local"),
-			LocalDir:   env("WECHAT_STORAGE_LOCAL_DIR", "./data/objects"),
-			S3Endpoint: os.Getenv("WECHAT_S3_ENDPOINT"),
-			S3Bucket:   os.Getenv("WECHAT_S3_BUCKET"),
-			S3Key:      os.Getenv("WECHAT_S3_KEY"),
-			S3Secret:   os.Getenv("WECHAT_S3_SECRET"),
-			S3UseSSL:   envBool("WECHAT_S3_USE_SSL", true),
+			Driver:        env("WECHAT_STORAGE_DRIVER", "local"),
+			LocalDir:      env("WECHAT_STORAGE_LOCAL_DIR", "./data/objects"),
+			S3Endpoint:    os.Getenv("WECHAT_S3_ENDPOINT"),
+			S3Bucket:      os.Getenv("WECHAT_S3_BUCKET"),
+			S3Key:         os.Getenv("WECHAT_S3_KEY"),
+			S3Secret:      os.Getenv("WECHAT_S3_SECRET"),
+			S3UseSSL:      envBool("WECHAT_S3_USE_SSL", true),
 			PublicBaseURL: env("WECHAT_PUBLIC_BASE_URL", "http://127.0.0.1:8080"),
 		},
 		MQ: MQ{
@@ -168,9 +171,11 @@ func (c *Config) validate() error {
 		return fmt.Errorf("config: WECHAT_STORAGE_DRIVER must be s3|local, got %q", c.Storage.Driver)
 	}
 	switch c.MQ.Driver {
-	case "rabbitmq", "none":
+	case "none":
+	case "rabbitmq":
+		return fmt.Errorf("config: WECHAT_MQ_DRIVER=rabbitmq is not implemented yet")
 	default:
-		return fmt.Errorf("config: WECHAT_MQ_DRIVER must be rabbitmq|none, got %q", c.MQ.Driver)
+		return fmt.Errorf("config: WECHAT_MQ_DRIVER must be none (rabbitmq not implemented), got %q", c.MQ.Driver)
 	}
 	if c.Auth.AccessTTL <= 0 || c.Auth.RefreshTTL <= c.Auth.AccessTTL {
 		return fmt.Errorf("config: refresh TTL must exceed access TTL")
@@ -181,6 +186,14 @@ func (c *Config) validate() error {
 	if c.Storage.Driver == "s3" && (c.Storage.S3Endpoint == "" || c.Storage.S3Bucket == "") {
 		return fmt.Errorf("config: s3 driver requires WECHAT_S3_ENDPOINT and WECHAT_S3_BUCKET")
 	}
+	for _, proxy := range c.HTTP.TrustedProxies {
+		if _, err := netip.ParsePrefix(proxy); err == nil {
+			continue
+		}
+		if _, err := netip.ParseAddr(proxy); err != nil {
+			return fmt.Errorf("config: WECHAT_TRUSTED_PROXIES contains invalid IP/CIDR %q", proxy)
+		}
+	}
 	return nil
 }
 
@@ -190,6 +203,20 @@ func parseIDList(s string) map[int64]bool {
 		part = strings.TrimSpace(part)
 		if n, err := strconv.ParseInt(part, 10, 64); err == nil && n > 0 {
 			out[n] = true
+		}
+	}
+	return out
+}
+
+func csv(s string) []string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if value := strings.TrimSpace(part); value != "" {
+			out = append(out, value)
 		}
 	}
 	return out

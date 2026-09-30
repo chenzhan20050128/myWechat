@@ -11,19 +11,23 @@ import (
 	"github.com/example/wechat/internal/platform/mq"
 	"github.com/example/wechat/internal/platform/mysqlx"
 	"github.com/example/wechat/internal/platform/outbox"
+	"github.com/example/wechat/internal/ws"
 )
 
 // Friend is the port message uses to authorize direct-message send (R3).
 type Friend interface {
 	CanSendMessage(ctx context.Context, from, to int64) (bool, string, error)
+	CanSendMessageTx(ctx context.Context, tx mysqlx.Tx, from, to int64) (bool, string, error)
 }
 
 // Group is the port message uses for group send/read rules (R4/R15).
 type Group interface {
 	CanSend(ctx context.Context, groupID, userID int64) error
+	CanSendTx(ctx context.Context, tx mysqlx.Tx, groupID, userID int64) error
 	IsModerator(ctx context.Context, groupID, userID int64) (bool, error)
 	GroupByConversation(ctx context.Context, conversationID int64) (GroupRowView, error)
 	WasMemberAt(ctx context.Context, groupID, userID int64, at time.Time) (bool, error)
+	WasMemberAtMany(ctx context.Context, groupID, userID int64, ats []time.Time) ([]bool, error)
 	ListGroupConversationsForUser(ctx context.Context, userID int64) ([]GroupConvView, error)
 }
 
@@ -46,6 +50,9 @@ type GroupConvView struct {
 type Media interface {
 	// AssertReady verifies object is owned by ownerID, status=ready, mime-prefixed by kind.
 	AssertReady(ctx context.Context, ownerID, objectID int64, kind string) error
+	AssertReadyTx(ctx context.Context, tx mysqlx.Tx, ownerID, objectID int64, kind string) error
+	BindMessageAssetTx(ctx context.Context, tx mysqlx.Tx, messageID, objectID int64, participantIDs []int64) error
+	EnqueueGCTx(ctx context.Context, tx mysqlx.Tx, objectIDs []int64, purgeAfter time.Time) error
 	// OnReferencesRemoved is invoked by the retention worker when a message
 	// referencing these objects expires. V1: GC hook (SPEC-03 R13).
 	OnReferencesRemoved(ctx context.Context, objectIDs []int64) error
@@ -56,15 +63,21 @@ type DirectLookup interface {
 	IsMember(ctx context.Context, conversationID, userID int64) (bool, error)
 }
 
+// Pusher is the WebSocket delivery port.
+type Pusher interface {
+	Deliver(ctx context.Context, userID int64, f ws.Frame)
+}
+
 // Service owns message rows, conversation_seq, references, forwards, pins,
 // conversation settings and the 180-day retention worker (SPEC-04).
 type Service struct {
-	db    *sql.DB
+	db     *sql.DB
 	friend Friend
-	group Group
-	media Media
-	conv  DirectLookup
-	now   func() time.Time
+	group  Group
+	media  Media
+	conv   DirectLookup
+	pusher Pusher
+	now    func() time.Time
 }
 
 // New wires the message service.
@@ -72,16 +85,18 @@ func New(db *sql.DB, f Friend, g Group, m Media, c DirectLookup, now func() time
 	return &Service{db: db, friend: f, group: g, media: m, conv: c, now: now}
 }
 
+func (s *Service) SetPusher(p Pusher) { s.pusher = p }
+
 // ---------------------------------------------------------------------------
 // Send (R1/R2/R3/R4/R5/R6/R7/R8/R10/R11).
 
 // SendInput is POST /conversations/{id}/messages.
 type SendInput struct {
-	ClientMsgID      string
-	Type             string
-	Payload          json.RawMessage
-	RefMessageID     int64
-	ForwardSourceID  int64
+	ClientMsgID     string
+	Type            string
+	Payload         json.RawMessage
+	RefMessageID    int64
+	ForwardSourceID int64
 }
 
 // SendResult is the A1 response (R8).
@@ -136,6 +151,9 @@ func (s *Service) Send(ctx context.Context, senderID, conversationID int64, in S
 	var out SendResult
 	txErr := mysqlx.WithinTx(ctx, s.db, func(tx mysqlx.Tx) error {
 		now := s.now()
+		if err := s.authorizeSendTx(ctx, tx, senderID, conversationID, in.Type, convType, groupID, payload); err != nil {
+			return err
+		}
 		lastSeq, lockedType, err := lockConversation(ctx, tx, conversationID)
 		if err != nil {
 			return err
@@ -175,6 +193,13 @@ func (s *Service) Send(ctx context.Context, senderID, conversationID int64, in S
 			if err := insertAsset(ctx, tx, msgID, oid, kind, now); err != nil {
 				return err
 			}
+			participants, err := conversationMemberIDs(ctx, tx, conversationID)
+			if err != nil {
+				return err
+			}
+			if err := s.media.BindMessageAssetTx(ctx, tx, msgID, oid, participants); err != nil {
+				return err
+			}
 		}
 		if ref != nil {
 			if err := insertReference(ctx, tx, msgID, ref.RefMsgID, ref.RefSenderID, ref.RefType, ref.RefDigest, now); err != nil {
@@ -192,13 +217,75 @@ func (s *Service) Send(ctx context.Context, senderID, conversationID int64, in S
 			return err
 		}
 		out = SendResult{MessageID: msgID, ConversationID: conversationID, ConversationSeq: seq, Status: StatusStored, CreatedAt: now}
-		_ = groupID
 		return nil
 	})
 	if txErr != nil {
 		return SendResult{}, txErr
 	}
 	return out, nil
+}
+
+func (s *Service) authorizeSendTx(
+	ctx context.Context,
+	tx mysqlx.Tx,
+	senderID, conversationID int64,
+	msgType, convType string,
+	groupID int64,
+	p *Payload,
+) error {
+	switch convType {
+	case "direct":
+		partner, err := otherDirectMember(ctx, tx, conversationID, senderID)
+		if err != nil {
+			return err
+		}
+		allowed, reason, err := s.friend.CanSendMessageTx(ctx, tx, senderID, partner)
+		if err != nil {
+			return err
+		}
+		if !allowed {
+			return apperrors.New(apperrors.Forbidden, reason)
+		}
+	case "group":
+		if err := s.group.CanSendTx(ctx, tx, groupID, senderID); err != nil {
+			return err
+		}
+	case "transfer":
+		owner, err := transferOwner(ctx, tx, conversationID)
+		if err != nil {
+			return err
+		}
+		if owner != senderID {
+			return apperrors.Unavail("transfer conversation is owner-only")
+		}
+	case "official_service":
+		return apperrors.New(apperrors.StateConflict, "official_service sending not wired in phase 2")
+	default:
+		return apperrors.Unavail("unknown conversation type")
+	}
+	if kind := assetKind(msgType); kind != "" {
+		oid, err := strconv.ParseInt(p.MediaObjectID, 10, 64)
+		if err != nil {
+			return apperrors.Invalid("media_object_id must be an integer id")
+		}
+		if err := s.media.AssertReadyTx(ctx, tx, senderID, oid, kind); err != nil {
+			return err
+		}
+	}
+	if msgType == TypeCard {
+		targetID, err := strconv.ParseInt(p.UserID, 10, 64)
+		if err != nil {
+			return apperrors.Invalid("card user_id must be an integer id")
+		}
+		allowed, _, err := s.friend.CanSendMessageTx(ctx, tx, senderID, targetID)
+		if err != nil {
+			return err
+		}
+		if !allowed {
+			return apperrors.Invalid("card target must be a current friend")
+		}
+	}
+	return nil
 }
 
 // precheckSend runs all R3-R6 authorization rules outside the conversation lock.
@@ -328,6 +415,38 @@ func (s *Service) MarkDelivered(ctx context.Context, messageID int64) error {
 	return markDelivered(ctx, s.db, messageID)
 }
 
+// PushMessage fans a stored/recalled event out to current conversation members.
+func (s *Service) PushMessage(ctx context.Context, messageID int64, event string) error {
+	if s.pusher == nil {
+		return nil
+	}
+	r, err := getMessage(ctx, s.db, messageID)
+	if err != nil {
+		return err
+	}
+	if r.Status == StatusExpired {
+		return nil
+	}
+	recipientIDs, err := conversationMemberIDs(ctx, s.db, r.ConversationID)
+	if err != nil {
+		return err
+	}
+	frame := ws.Frame{
+		Type:            event,
+		ConversationID:  strconv.FormatInt(r.ConversationID, 10),
+		MessageID:       strconv.FormatInt(r.ID, 10),
+		ConversationSeq: r.ConversationSeq,
+		SenderID:        strconv.FormatInt(r.SenderID, 10),
+	}
+	if r.Status != StatusRecalled {
+		frame.Preview = previewDigest(r)
+	}
+	for _, recipientID := range recipientIDs {
+		s.pusher.Deliver(ctx, recipientID, frame)
+	}
+	return nil
+}
+
 // SendSystemTx implements the group.SystemMessenger port (system message in a tx).
 func (s *Service) SendSystemTx(ctx context.Context, tx mysqlx.Tx, conversationID int64, event string, detail map[string]any) error {
 	now := s.now()
@@ -394,16 +513,16 @@ type AssetView struct {
 
 // HistoryInput is A2.
 type HistoryInput struct {
-	AfterSeq    uint64
-	BeforeSeq   uint64
-	Limit       int
+	AfterSeq  uint64
+	BeforeSeq uint64
+	Limit     int
 }
 
 // HistoryResult is A2 response.
 type HistoryResult struct {
-	Messages  []MessageView `json:"messages"`
-	HasMore   bool          `json:"has_more"`
-	NextSeq   uint64        `json:"next_cursor"`
+	Messages []MessageView `json:"messages"`
+	HasMore  bool          `json:"has_more"`
+	NextSeq  uint64        `json:"next_cursor"`
 }
 
 // History returns messages in (after, before] that user may read (R14/R15/R16).
@@ -438,15 +557,9 @@ func (s *Service) History(ctx context.Context, userID, conversationID int64, in 
 		return HistoryResult{}, err
 	}
 
-	visible := make([]MessageRow, 0, len(rows))
-	for _, r := range rows {
-		ok, verr := s.canRead(ctx, userID, conversationID, r)
-		if verr != nil {
-			return HistoryResult{}, verr
-		}
-		if ok {
-			visible = append(visible, r)
-		}
+	visible, err := s.filterVisible(ctx, userID, conversationID, rows)
+	if err != nil {
+		return HistoryResult{}, err
 	}
 	hasMore := len(visible) > limit
 	if hasMore {
@@ -461,6 +574,62 @@ func (s *Service) History(ctx context.Context, userID, conversationID int64, in 
 		nextSeq = views[n-1].ConversationSeq
 	}
 	return HistoryResult{Messages: views, HasMore: hasMore, NextSeq: nextSeq}, nil
+}
+
+func (s *Service) filterVisible(ctx context.Context, userID, conversationID int64, rows []MessageRow) ([]MessageRow, error) {
+	live := make([]MessageRow, 0, len(rows))
+	for _, r := range rows {
+		if r.Status != StatusExpired {
+			live = append(live, r)
+		}
+	}
+	if len(live) == 0 {
+		return live, nil
+	}
+	ct, err := conversationType(ctx, s.db, conversationID)
+	if err != nil {
+		return nil, err
+	}
+	switch ct {
+	case "direct", "transfer", "official_service":
+		member, err := s.conv.IsMember(ctx, conversationID, userID)
+		if err != nil || !member {
+			return nil, err
+		}
+		return live, nil
+	case "group":
+		g, err := s.group.GroupByConversation(ctx, conversationID)
+		if err != nil {
+			return nil, err
+		}
+		positions := make([]int, 0, len(live))
+		ats := make([]time.Time, 0, len(live))
+		for i, r := range live {
+			if r.SenderID != userID {
+				positions = append(positions, i)
+				ats = append(ats, r.CreatedAt)
+			}
+		}
+		if len(ats) == 0 {
+			return live, nil
+		}
+		ok, err := s.group.WasMemberAtMany(ctx, g.GroupID, userID, ats)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]MessageRow, 0, len(live))
+		okByPos := make(map[int]bool, len(positions))
+		for i, pos := range positions {
+			okByPos[pos] = ok[i]
+		}
+		for i, r := range live {
+			if r.SenderID == userID || okByPos[i] {
+				out = append(out, r)
+			}
+		}
+		return out, nil
+	}
+	return nil, nil
 }
 
 // canRead enforces R15 visibility per message.
@@ -491,6 +660,28 @@ func (s *Service) canRead(ctx context.Context, userID, conversationID int64, r M
 // decorate attaches reference/asset views and masks recalled payloads.
 func (s *Service) decorate(ctx context.Context, rows []MessageRow) ([]MessageView, error) {
 	out := make([]MessageView, 0, len(rows))
+	ids := make([]int64, len(rows))
+	for i, r := range rows {
+		ids[i] = r.ID
+	}
+	refs, err := loadReferencesBatch(ctx, s.db, ids)
+	if err != nil {
+		return nil, err
+	}
+	refIDs := make([]int64, 0, len(refs))
+	for _, ref := range refs {
+		if ref.RefMsgID != 0 {
+			refIDs = append(refIDs, ref.RefMsgID)
+		}
+	}
+	refStatuses, err := messageStatuses(ctx, s.db, refIDs)
+	if err != nil {
+		return nil, err
+	}
+	assets, err := assetRowsForMessages(ctx, s.db, ids)
+	if err != nil {
+		return nil, err
+	}
 	for _, r := range rows {
 		v := MessageView{
 			MessageID: r.ID, ConversationID: r.ConversationID, ConversationSeq: r.ConversationSeq,
@@ -500,24 +691,18 @@ func (s *Service) decorate(ctx context.Context, rows []MessageRow) ([]MessageVie
 		if r.Status != StatusRecalled {
 			v.Payload = r.Payload
 		}
-		if ref, err := loadReference(ctx, s.db, r.ID); err != nil {
-			return nil, err
-		} else if ref.RefMsgID != 0 {
+		if ref := refs[r.ID]; ref.RefMsgID != 0 {
 			refStatus := StatusStored
-			if refMsg, gerr := getMessage(ctx, s.db, ref.RefMsgID); gerr == nil {
-				refStatus = refMsg.Status
+			if status, ok := refStatuses[ref.RefMsgID]; ok {
+				refStatus = status
 			}
 			v.Reference = &RefView{
 				MessageID: ref.RefMsgID, SenderID: ref.RefSenderID,
 				Type: ref.RefType, Digest: ref.RefDigest, Status: refStatus,
 			}
 		}
-		if assets, err := assetRowsForMessage(ctx, s.db, r.ID); err != nil {
-			return nil, err
-		} else {
-			for _, a := range assets {
-				v.Assets = append(v.Assets, AssetView{MediaObjectID: a.MediaObjectID, Kind: a.Kind})
-			}
+		for _, a := range assets[r.ID] {
+			v.Assets = append(v.Assets, AssetView{MediaObjectID: a.MediaObjectID, Kind: a.Kind})
 		}
 		out = append(out, v)
 	}
@@ -634,6 +819,9 @@ func (s *Service) Pin(ctx context.Context, userID, conversationID, messageID int
 		return apperrors.Invalid("pins not allowed in this conversation type")
 	}
 	return mysqlx.WithinTx(ctx, s.db, func(tx mysqlx.Tx) error {
+		if _, _, err := lockConversation(ctx, tx, conversationID); err != nil {
+			return err
+		}
 		n, err := countPins(ctx, tx, conversationID)
 		if err != nil {
 			return err
@@ -678,15 +866,15 @@ func (s *Service) ListPins(ctx context.Context, conversationID int64) ([]Message
 
 // ConversationSummary is one element of A3.
 type ConversationSummary struct {
-	ConversationID int64         `json:"conversation_id,string"`
-	Type           string        `json:"type"`
-	Title          string        `json:"title"`
-	LastPreview    string        `json:"last_preview"`
-	LastSeq        uint64        `json:"last_seq"`
-	Unread         int           `json:"unread"`
-	Pinned         bool          `json:"pinned"`
-	Muted          bool          `json:"muted"`
-	LastMessageAt   time.Time     `json:"last_message_at"`
+	ConversationID int64     `json:"conversation_id,string"`
+	Type           string    `json:"type"`
+	Title          string    `json:"title"`
+	LastPreview    string    `json:"last_preview"`
+	LastSeq        uint64    `json:"last_seq"`
+	Unread         int       `json:"unread"`
+	Pinned         bool      `json:"pinned"`
+	Muted          bool      `json:"muted"`
+	LastMessageAt  time.Time `json:"last_message_at"`
 }
 
 // ListConversations returns R19 summaries.
@@ -783,9 +971,9 @@ func previewDigest(r MessageRow) string {
 
 // ConversationDetail is A4.
 type ConversationDetail struct {
-	ConversationID int64         `json:"conversation_id,string"`
-	Type           string        `json:"type"`
-	Settings       SettingsRow   `json:"settings"`
+	ConversationID int64       `json:"conversation_id,string"`
+	Type           string      `json:"type"`
+	Settings       SettingsRow `json:"settings"`
 }
 
 // GetConversation returns conversation detail + my settings (A4).
@@ -845,6 +1033,14 @@ func (s *Service) runSweepBatch(ctx context.Context, batch int) (int, error) {
 			if err := deleteAssets(ctx, tx, id); err != nil {
 				return err
 			}
+			if err := deleteMessageReferences(ctx, tx, id); err != nil {
+				return err
+			}
+			if s.media != nil {
+				if err := s.media.EnqueueGCTx(ctx, tx, assets, now); err != nil {
+					return err
+				}
+			}
 			expiredIDs = append(expiredIDs, id)
 			assetIDs = append(assetIDs, assets...)
 		}
@@ -872,8 +1068,8 @@ type ForwardInput struct {
 
 // ForwardResult is one element of A9 results.
 type ForwardResult struct {
-	ConversationID  int64 `json:"conversation_id,string"`
-	MessageID       int64 `json:"message_id,string"`
+	ConversationID  int64  `json:"conversation_id,string"`
+	MessageID       int64  `json:"message_id,string"`
 	ConversationSeq uint64 `json:"conversation_seq"`
 }
 

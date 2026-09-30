@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -20,6 +21,9 @@ import (
 type fakeMedia struct{}
 
 func (fakeMedia) OnReferencesRemoved(_ context.Context, _ []int64) error { return nil }
+func (fakeMedia) EnqueueGCTx(_ context.Context, _ mysqlx.Tx, _ []int64, _ time.Time) error {
+	return nil
+}
 
 type env struct {
 	db  *sql.DB
@@ -92,6 +96,45 @@ func TestT2_IdempotentSourceMessage(t *testing.T) {
 		t.Fatalf("second: id1=%d id2=%d dup=%v err=%v", id1, id2, dup2, err)
 	}
 	_ = dup1
+}
+
+func TestConcurrentSourceFavoritesDedupe(t *testing.T) {
+	e := newEnv(t)
+	owner := e.newUser(t)
+	msgID := int64(424243)
+	content := json.RawMessage(`{"content":"concurrent"}`)
+	input := &CreateInput{OwnerID: owner, Kind: "text", Content: content, SourceMessageID: &msgID}
+
+	const creators = 12
+	ids := make([]int64, creators)
+	dups := make([]bool, creators)
+	errs := make([]error, creators)
+	var wg sync.WaitGroup
+	for i := 0; i < creators; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ids[i], dups[i], errs[i] = e.svc.Create(context.Background(), input)
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("creator %d: %v", i, err)
+		}
+		if ids[i] != ids[0] {
+			t.Fatalf("creator %d got favorite %d, want %d", i, ids[i], ids[0])
+		}
+	}
+	successes := 0
+	for _, dup := range dups {
+		if dup {
+			successes++
+		}
+	}
+	if successes != creators-1 {
+		t.Fatalf("duplicate responses = %d, want %d", successes, creators-1)
+	}
 }
 
 // T3: invalid kind rejected.

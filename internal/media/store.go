@@ -13,20 +13,22 @@ import (
 
 // SessionRow is one upload_sessions row (R1).
 type SessionRow struct {
-	ID            string
-	OwnerID       int64
-	FileName      string
-	DeclaredSize  int64
-	DeclaredMIME  string
-	DeclaredSHA   string
-	Purpose       string
-	ChunkSize     int64
-	TotalChunks   int
-	Status        string
-	MediaObjectID int64 // 0 = none
-	ExpiresAt     time.Time
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	ID                string
+	OwnerID           int64
+	FileName          string
+	DeclaredSize      int64
+	DeclaredMIME      string
+	DeclaredSHA       string
+	Purpose           string
+	ChunkSize         int64
+	TotalChunks       int
+	Status            string
+	MediaObjectID     int64 // 0 = none
+	AssemblyOwner     string
+	AssemblyExpiresAt *time.Time
+	ExpiresAt         time.Time
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
 }
 
 // ObjectRow is one media_objects row (R10).
@@ -43,15 +45,24 @@ type ObjectRow struct {
 }
 
 const sessionColumns = `id, owner_id, file_name, declared_size, declared_mime, declared_sha256,
-	purpose, chunk_size, total_chunks, status, media_object_id, expires_at, created_at, updated_at`
+	purpose, chunk_size, total_chunks, status, media_object_id, assembly_owner, assembly_expires_at,
+	expires_at, created_at, updated_at`
 
 func scanSession(row interface{ Scan(...any) error }) (SessionRow, error) {
 	var s SessionRow
 	var objectID sql.NullInt64
+	var assemblyOwner sql.NullString
+	var assemblyExpiresAt sql.NullTime
 	err := row.Scan(&s.ID, &s.OwnerID, &s.FileName, &s.DeclaredSize, &s.DeclaredMIME, &s.DeclaredSHA,
-		&s.Purpose, &s.ChunkSize, &s.TotalChunks, &s.Status, &objectID, &s.ExpiresAt, &s.CreatedAt, &s.UpdatedAt)
+		&s.Purpose, &s.ChunkSize, &s.TotalChunks, &s.Status, &objectID, &assemblyOwner, &assemblyExpiresAt,
+		&s.ExpiresAt, &s.CreatedAt, &s.UpdatedAt)
 	if objectID.Valid {
 		s.MediaObjectID = objectID.Int64
+	}
+	s.AssemblyOwner = assemblyOwner.String
+	if assemblyExpiresAt.Valid {
+		t := assemblyExpiresAt.Time
+		s.AssemblyExpiresAt = &t
 	}
 	return s, err
 }
@@ -82,6 +93,42 @@ func findSession(ctx context.Context, db mysqlx.DBTX, id string) (SessionRow, er
 		return SessionRow{}, fmt.Errorf("media: find session: %w", err)
 	}
 	return s, nil
+}
+
+func claimForAssembly(ctx context.Context, tx mysqlx.Tx, owner int64, id, assemblyOwner string, now time.Time) (SessionRow, bool, error) {
+	row, err := scanSession(tx.QueryRowContext(ctx,
+		`SELECT `+sessionColumns+` FROM upload_sessions WHERE id = ? FOR UPDATE`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return SessionRow{}, false, apperrors.Unavail("upload session not found")
+	}
+	if err != nil {
+		return SessionRow{}, false, fmt.Errorf("media: claim session: %w", err)
+	}
+	if row.OwnerID != owner {
+		return SessionRow{}, false, apperrors.Unavail("upload session not found")
+	}
+	if row.Status == SessionCompleted {
+		return row, true, nil
+	}
+	staleAssembly := row.Status == SessionAssembling && (row.AssemblyExpiresAt == nil || !now.Before(*row.AssemblyExpiresAt))
+	if row.Status != SessionOpen && !staleAssembly {
+		return SessionRow{}, false, apperrors.Conflict("upload session is " + row.Status)
+	}
+	if !now.Before(row.ExpiresAt) {
+		return SessionRow{}, false, apperrors.Unavail("upload session expired")
+	}
+	leaseUntil := now.Add(AssemblyLeaseTTL)
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE upload_sessions
+		SET status = 'assembling', assembly_owner = ?, assembly_expires_at = ?, updated_at = ?
+		WHERE id = ? AND (status = 'open' OR (status = 'assembling' AND (assembly_expires_at IS NULL OR assembly_expires_at < ?)))`,
+		assemblyOwner, leaseUntil, now, id, now); err != nil {
+		return SessionRow{}, false, fmt.Errorf("media: claim assembly: %w", err)
+	}
+	row.Status = SessionAssembling
+	row.AssemblyOwner = assemblyOwner
+	row.AssemblyExpiresAt = &leaseUntil
+	return row, false, nil
 }
 
 // findObjectByKey resolves the proxy token's key back to an object row (R16).
@@ -158,11 +205,12 @@ func missingChunks(ctx context.Context, db mysqlx.DBTX, uploadID string, total i
 
 // completeSession performs the §5 idempotent transition open→completed.
 // It reports whether this call is the one that completed the session.
-func completeSession(ctx context.Context, tx mysqlx.Tx, id string, objectID int64, now time.Time) (bool, error) {
+func completeSession(ctx context.Context, tx mysqlx.Tx, id, assemblyOwner string, objectID int64, now time.Time) (bool, error) {
 	res, err := tx.ExecContext(ctx, `
 		UPDATE upload_sessions
-		SET status = 'completed', media_object_id = ?, updated_at = ?
-		WHERE id = ? AND status = 'open'`, objectID, now, id)
+		SET status = 'completed', media_object_id = ?, assembly_owner = NULL, assembly_expires_at = NULL, updated_at = ?
+		WHERE id = ? AND status = 'assembling' AND assembly_owner = ? AND assembly_expires_at > ?`,
+		objectID, now, id, assemblyOwner, now)
 	if err != nil {
 		return false, fmt.Errorf("media: complete session: %w", err)
 	}
@@ -173,18 +221,36 @@ func completeSession(ctx context.Context, tx mysqlx.Tx, id string, objectID int6
 	return n == 1, nil
 }
 
+func releaseAssembly(ctx context.Context, tx mysqlx.Tx, id, assemblyOwner string, now time.Time) error {
+	_, err := tx.ExecContext(ctx, `
+		UPDATE upload_sessions
+		SET status = 'open', assembly_owner = NULL, assembly_expires_at = NULL, updated_at = ?
+		WHERE id = ? AND status = 'assembling' AND assembly_owner = ?`, now, id, assemblyOwner)
+	return err
+}
+
 // closeSession marks a session terminal (aborted) and clears its chunks (§4).
 func closeSession(ctx context.Context, tx mysqlx.Tx, id, status string, now time.Time) error {
+	res, err := tx.ExecContext(ctx, `
+		UPDATE upload_sessions SET status = ?, updated_at = ? WHERE id = ? AND status = 'open'`, status, now, id)
+	if err != nil {
+		return fmt.Errorf("media: close session: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("media: close affected: %w", err)
+	}
+	if n != 1 {
+		return errSessionNotOpen
+	}
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM upload_chunks WHERE upload_id = ?`, id); err != nil {
 		return fmt.Errorf("media: delete chunks: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE upload_sessions SET status = ?, updated_at = ? WHERE id = ?`, status, now, id); err != nil {
-		return fmt.Errorf("media: close session: %w", err)
-	}
 	return nil
 }
+
+var errSessionNotOpen = errors.New("media: upload session is no longer open")
 
 // expireStaleSessions flips open sessions past their deadline to expired (R7).
 func expireStaleSessions(ctx context.Context, db mysqlx.DBTX, now time.Time) ([]string, error) {
@@ -228,11 +294,20 @@ func insertObject(ctx context.Context, tx mysqlx.Tx, o ObjectRow) (int64, error)
 
 // findObject loads an object; missing → RESOURCE_UNAVAILABLE (R14).
 func findObject(ctx context.Context, db mysqlx.DBTX, id int64) (ObjectRow, error) {
-	var o ObjectRow
-	err := db.QueryRowContext(ctx, `
+	return scanObject(db.QueryRowContext(ctx, `
 		SELECT id, owner_id, bucket_key, size, sha256, mime, purpose, status, created_at
-		FROM media_objects WHERE id = ?`, id).
-		Scan(&o.ID, &o.OwnerID, &o.BucketKey, &o.Size, &o.SHA256, &o.MIME, &o.Purpose, &o.Status, &o.CreatedAt)
+		FROM media_objects WHERE id = ?`, id))
+}
+
+func findObjectForUpdate(ctx context.Context, tx mysqlx.Tx, id int64) (ObjectRow, error) {
+	return scanObject(tx.QueryRowContext(ctx, `
+		SELECT id, owner_id, bucket_key, size, sha256, mime, purpose, status, created_at
+		FROM media_objects WHERE id = ? FOR UPDATE`, id))
+}
+
+func scanObject(row interface{ Scan(...any) error }) (ObjectRow, error) {
+	var o ObjectRow
+	err := row.Scan(&o.ID, &o.OwnerID, &o.BucketKey, &o.Size, &o.SHA256, &o.MIME, &o.Purpose, &o.Status, &o.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ObjectRow{}, apperrors.Unavail("media object not found")
 	}
@@ -292,6 +367,58 @@ func ensureUserReference(ctx context.Context, tx mysqlx.Tx, objectID, userID, gr
 	}
 	if err != nil {
 		return fmt.Errorf("media: user reference: %w", err)
+	}
+	return nil
+}
+
+func hasActiveUserReference(ctx context.Context, db mysqlx.DBTX, objectID, userID int64) (bool, error) {
+	var one int
+	err := db.QueryRowContext(ctx, `
+		SELECT 1 FROM media_user_references
+		WHERE object_id = ? AND user_id = ? AND revoked_at IS NULL LIMIT 1`, objectID, userID).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("media: user reference check: %w", err)
+	}
+	return true, nil
+}
+
+func enqueueGCTasks(ctx context.Context, tx mysqlx.Tx, objectIDs []int64, now, purgeAfter time.Time) error {
+	for _, objectID := range objectIDs {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT IGNORE INTO media_gc_tasks (object_id, status, purge_after, created_at, updated_at)
+			VALUES (?, 'pending', ?, ?, ?)`, objectID, purgeAfter, now, now); err != nil {
+			return fmt.Errorf("media: enqueue gc: %w", err)
+		}
+	}
+	return nil
+}
+
+func activeReferenceCount(ctx context.Context, tx mysqlx.Tx, objectID int64) (int, error) {
+	var n int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM media_references WHERE object_id = ?`, objectID).Scan(&n); err != nil {
+		return 0, fmt.Errorf("media: count references: %w", err)
+	}
+	return n, nil
+}
+
+func markObjectCleaned(ctx context.Context, tx mysqlx.Tx, objectID int64, now time.Time) error {
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE media_objects SET status = ?, updated_at = ? WHERE id = ?`,
+		ObjectCleaned, now, objectID); err != nil {
+		return fmt.Errorf("media: mark cleaned: %w", err)
+	}
+	return nil
+}
+
+func markGCTaskDone(ctx context.Context, tx mysqlx.Tx, objectID int64, now time.Time) error {
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE media_gc_tasks SET status = 'done', lease_until = NULL, updated_at = ?
+		WHERE object_id = ?`, now, objectID); err != nil {
+		return fmt.Errorf("media: finish gc: %w", err)
 	}
 	return nil
 }

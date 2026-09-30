@@ -19,8 +19,8 @@ import (
 	"github.com/example/wechat/internal/platform/argon"
 	"github.com/example/wechat/internal/platform/cache"
 	"github.com/example/wechat/internal/platform/clock"
-	"github.com/example/wechat/internal/platform/httpx"
 	apperrors "github.com/example/wechat/internal/platform/errors"
+	"github.com/example/wechat/internal/platform/httpx"
 	"github.com/example/wechat/internal/platform/ids"
 	"github.com/example/wechat/internal/platform/mysqlx"
 	"github.com/example/wechat/internal/platform/ratelimit"
@@ -29,19 +29,19 @@ import (
 )
 
 const (
-	failKeyPrefix  = "fail:login:" // consecutive-failure counter
-	lockKeyPrefix  = "lock:login:" // freeze marker
-	refreshRLName  = "auth.refresh"
-	dummyHash      = "$argon2id$v=19$m=65536,t=3,p=2$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" // timing equalizer (A2)
+	failKeyPrefix = "fail:login:" // consecutive-failure counter
+	lockKeyPrefix = "lock:login:" // freeze marker
+	refreshRLName = "auth.refresh"
+	dummyHash     = "$argon2id$v=19$m=65536,t=3,p=2$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" // timing equalizer (A2)
 )
 
 // Config carries the tunables (from platform config).
 type Config struct {
-	AccessTTL      time.Duration
-	RefreshTTL     time.Duration
-	LoginMaxFails  int
-	LoginFreeze    time.Duration
-	Argon          argon.Params
+	AccessTTL     time.Duration
+	RefreshTTL    time.Duration
+	LoginMaxFails int
+	LoginFreeze   time.Duration
+	Argon         argon.Params
 }
 
 // Service is the auth façade.
@@ -70,13 +70,13 @@ func New(db *sql.DB, devices *device.Service, users *user.Service, convs *conver
 
 // TokenPair is the login/register/refresh response payload.
 type TokenPair struct {
-	UserID            int64     `json:"user_id,string"`
-	AccessToken       string    `json:"access_token"`
-	AccessExpiresAt   time.Time `json:"access_expires_at"`
-	RefreshToken      string    `json:"refresh_token"`
-	RefreshExpiresAt  time.Time `json:"refresh_expires_at"`
-	DeviceID          string    `json:"device_id"`
-	MustChangePwd     bool      `json:"must_change_password"`
+	UserID           int64     `json:"user_id,string"`
+	AccessToken      string    `json:"access_token"`
+	AccessExpiresAt  time.Time `json:"access_expires_at"`
+	RefreshToken     string    `json:"refresh_token"`
+	RefreshExpiresAt time.Time `json:"refresh_expires_at"`
+	DeviceID         string    `json:"device_id"`
+	MustChangePwd    bool      `json:"must_change_password"`
 }
 
 // DeviceInfo is the client-reported device identity (login/register body).
@@ -279,6 +279,9 @@ func (s *Service) Refresh(ctx context.Context, refreshToken, ip string) (TokenPa
 			Detail: map[string]any{"session_id": sess.ID}})
 		return TokenPair{}, apperrors.Unauth("invalid refresh token")
 	}
+	if sess.Revoked {
+		return TokenPair{}, apperrors.Unauth("invalid refresh token")
+	}
 	if !sess.RefreshExpiresAt.After(s.now.Now()) {
 		return TokenPair{}, apperrors.Unauth("refresh token expired")
 	}
@@ -322,7 +325,7 @@ func (s *Service) Refresh(ctx context.Context, refreshToken, ip string) (TokenPa
 		return TokenPair{}, err
 	}
 	// old access token is dead (single-active-token, D1): purge its cache entry
-	s.devices.PurgeAccessCache(ctx, hash)
+	s.devices.PurgeAccessCache(ctx, sess.AccessTokenHash)
 	return pair, nil
 }
 

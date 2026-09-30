@@ -19,6 +19,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -252,6 +253,52 @@ func TestA3CompleteIsIdempotent(t *testing.T) {
 	}
 }
 
+// A3/§5: concurrent completers may stage the object, but exactly one commits it.
+func TestA3ConcurrentCompleteAssemblesOnce(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	owner := e.newUser(t)
+	data := pngBytes(t)
+	row, err := e.svc.CreateSession(ctx, owner, CreateInput{
+		FileName: "race.png", Size: int64(len(data)), MIME: "image/png",
+		SHA256: shaOf(data), Purpose: PurposeAvatar,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.svc.PutChunk(ctx, owner, row.ID, 1, bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+
+	const completers = 12
+	ids := make([]int64, completers)
+	errs := make([]error, completers)
+	var wg sync.WaitGroup
+	for i := 0; i < completers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ids[i], errs[i] = e.svc.CompleteUpload(ctx, owner, row.ID)
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("completer %d: %v", i, err)
+		}
+		if ids[i] != ids[0] {
+			t.Fatalf("completer %d got object %d, want %d", i, ids[i], ids[0])
+		}
+	}
+	if n := e.count(t, `SELECT COUNT(*) FROM media_objects WHERE owner_id = ?`, owner); n != 1 {
+		t.Fatalf("objects = %d, want 1", n)
+	}
+	if n := e.count(t, `SELECT COUNT(*) FROM outbox_events WHERE type = 'media.process' AND aggregate_id = ?`,
+		strconv.FormatInt(ids[0], 10)); n != 1 {
+		t.Fatalf("media.process events = %d, want 1", n)
+	}
+}
+
 // A4: sessions and objects are invisible to anyone but their owner.
 func TestA4Ownership(t *testing.T) {
 	e := newEnv(t)
@@ -408,6 +455,69 @@ func TestAbortUpload(t *testing.T) {
 	}
 	if code := codeOf(t, e.svc.AbortUpload(ctx, owner, row.ID)); code != apperrors.StateConflict {
 		t.Fatalf("double abort: %s", code)
+	}
+}
+
+func TestExpireUploadsKeepsCompletedSession(t *testing.T) {
+	e := newEnv(t)
+	owner := e.newUser(t)
+	objectID, sessionID := e.upload(t, owner, pngBytes(t), PurposeAvatar, "image/png", shaOf(pngBytes(t)))
+
+	e.clk.Advance(SessionTTL + time.Minute)
+	n, err := e.svc.ExpireUploads(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := e.svc.GetSession(context.Background(), owner, sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != SessionCompleted || got.MediaObjectID != objectID {
+		t.Fatalf("completed session changed: %+v", got)
+	}
+	_ = n
+}
+
+func TestGCTaskCleansUnreferencedObject(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	owner := e.newUser(t)
+	data := pngBytes(t)
+	objectID, _ := e.upload(t, owner, data, PurposeMessage, "application/octet-stream", shaOf(data))
+	obj, err := findObject(ctx, e.db, objectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = mysqlx.WithinTx(ctx, e.db, func(tx mysqlx.Tx) error {
+		return e.svc.EnqueueGCTx(ctx, tx, []int64{objectID}, e.clk.Now())
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := e.svc.ProcessGCTasks(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("processed = %d, want 1", n)
+	}
+	var status string
+	if err := e.db.QueryRowContext(ctx, `SELECT status FROM media_objects WHERE id = ?`, objectID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != ObjectCleaned {
+		t.Fatalf("object status = %q", status)
+	}
+	if exists, err := e.store.Exists(ctx, obj.BucketKey); err != nil || exists {
+		t.Fatalf("object still exists: exists=%v err=%v", exists, err)
+	}
+	var taskStatus string
+	if err := e.db.QueryRowContext(ctx, `SELECT status FROM media_gc_tasks WHERE object_id = ?`, objectID).Scan(&taskStatus); err != nil {
+		t.Fatal(err)
+	}
+	if taskStatus != "done" {
+		t.Fatalf("GC task status = %q", taskStatus)
 	}
 }
 
