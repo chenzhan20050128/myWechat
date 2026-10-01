@@ -208,7 +208,7 @@ func (s *Service) buildSnapshot(ctx context.Context, in *PublishInput) ([]Visibi
 // canView is the single visibility gate every read path must pass through.
 // It combines publish-time snapshot AND realtime relationship (SPEC-06 §4.2):
 // status, author, hidden/blocked/no_moments, snapshot allowed, epoch match.
-func (s *Service) canView(ctx context.Context, viewerID int64, m MomentRow) (bool, error) {
+func (s *Service) canView(ctx context.Context, db mysqlx.DBTX, viewerID int64, m MomentRow) (bool, error) {
 	if m.Status != StatusVisible {
 		return false, nil
 	}
@@ -223,7 +223,7 @@ func (s *Service) canView(ctx context.Context, viewerID int64, m MomentRow) (boo
 		return false, nil
 	}
 	var epoch int64
-	err = s.db.QueryRowContext(ctx, `
+	err = db.QueryRowContext(ctx, `
 		SELECT friendship_epoch FROM moment_visibility_users WHERE moment_id = ? AND user_id = ? AND allowed = 1`,
 		m.ID, viewerID).Scan(&epoch)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -240,35 +240,8 @@ func (s *Service) canView(ctx context.Context, viewerID int64, m MomentRow) (boo
 }
 
 // canViewWithEpoch is the historical name retained for call sites; it delegates to canView.
-func (s *Service) canViewWithEpoch(ctx context.Context, viewerID int64, m MomentRow) (bool, error) {
-	if m.Status != StatusVisible {
-		return false, nil
-	}
-	if viewerID == m.AuthorID {
-		return true, nil
-	}
-	hidden, blocked, noMoments, err := s.contact.MomentPerm(ctx, m.AuthorID, viewerID)
-	if err != nil {
-		return false, err
-	}
-	if blocked || hidden || noMoments {
-		return false, nil
-	}
-	var epoch int64
-	err = s.db.QueryRowContext(ctx, `
-		SELECT friendship_epoch FROM moment_visibility_users WHERE moment_id = ? AND user_id = ? AND allowed = 1`,
-		m.ID, viewerID).Scan(&epoch)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	ok, err := s.contact.IsFriendCurrentEpoch(ctx, m.AuthorID, viewerID, epoch)
-	if err != nil {
-		return false, err
-	}
-	return ok, nil
+func (s *Service) canViewWithEpoch(ctx context.Context, db mysqlx.DBTX, viewerID int64, m MomentRow) (bool, error) {
+	return s.canView(ctx, db, viewerID, m)
 }
 
 // Delete soft-deletes the author's own moment (R12).
@@ -290,7 +263,7 @@ func (s *Service) Feed(ctx context.Context, viewerID, beforeID int64, limit int)
 	}
 	out := make([]MomentRow, 0, limit)
 	for _, m := range cands {
-		ok, err := s.canViewWithEpoch(ctx, viewerID, m)
+		ok, err := s.canViewWithEpoch(ctx, s.db, viewerID, m)
 		if err != nil {
 			return nil, err
 		}
@@ -316,7 +289,7 @@ func (s *Service) UserMoments(ctx context.Context, authorID, viewerID, beforeID 
 	}
 	out := make([]MomentRow, 0, limit)
 	for _, m := range cands {
-		ok, err := s.canViewWithEpoch(ctx, viewerID, m)
+		ok, err := s.canViewWithEpoch(ctx, s.db, viewerID, m)
 		if err != nil {
 			return nil, err
 		}
@@ -337,7 +310,7 @@ func (s *Service) Get(ctx context.Context, viewerID, momentID int64) (MomentRow,
 	if err != nil {
 		return MomentRow{}, err
 	}
-	ok, err := s.canViewWithEpoch(ctx, viewerID, m)
+	ok, err := s.canViewWithEpoch(ctx, s.db, viewerID, m)
 	if err != nil {
 		return MomentRow{}, err
 	}
@@ -363,7 +336,7 @@ func (s *Service) Like(ctx context.Context, momentID, userID int64) error {
 		if err != nil {
 			return err
 		}
-		ok, err := s.canViewWithEpoch(ctx, userID, m)
+		ok, err := s.canViewWithEpoch(ctx, tx, userID, m)
 		if err != nil {
 			return err
 		}
@@ -424,7 +397,7 @@ func (s *Service) AddComment(ctx context.Context, momentID, userID int64, replyT
 		if err != nil {
 			return err
 		}
-		ok, err := s.canViewWithEpoch(ctx, userID, m)
+		ok, err := s.canViewWithEpoch(ctx, tx, userID, m)
 		if err != nil {
 			return err
 		}

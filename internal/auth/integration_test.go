@@ -208,7 +208,7 @@ func TestLoginLockoutSurvivesCorrectPassword(t *testing.T) {
 	e := newEnv(t)
 	tag := uniqueTag(t)
 	pair := e.register(t, tag)
-	req := LoginRequest{LoginID: pair.DeviceID, Password: "wrong-password", Device: DeviceInfo{DeviceID: ids.New()}}
+	req := LoginRequest{LoginID: pair.DeviceID, Password: "wrongpass1", Device: DeviceInfo{DeviceID: ids.New()}}
 	// LoginID must be phone/account name, not device ID.
 	req.LoginID = "+86" + tag
 	for i := 0; i < 3; i++ {

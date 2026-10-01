@@ -182,8 +182,8 @@ type PreviewInput struct {
 type PreviewResult struct {
 	CleanupID  int64        `json:"cleanup_id"`
 	Items      []RefSummary `json:"items"`
-	TotalBytes  int64       `json:"total_bytes"`
-	Count       int         `json:"count"`
+	TotalBytes int64        `json:"total_bytes"`
+	Count      int          `json:"count"`
 }
 
 func (s *Service) Preview(ctx context.Context, in *PreviewInput) (*PreviewResult, error) {

@@ -138,7 +138,7 @@ func TestT3_StaleLeaseReclaimed(t *testing.T) {
 	id := ids.New()
 	_, err := e.db.ExecContext(context.Background(), `
 		INSERT INTO outbox_events (event_id, type, aggregate_id, version, queue, status, lease_owner, lease_expires_at, created_at, updated_at)
-		VALUES (?, 'message.stored', '42', 0, 'wechat.message.push', 'publishing', 'old', UTC_TIMESTAMP(6) - INTERVAL 1 MINUTE, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6))`,
+			VALUES (?, 'message.stored', '42', 0, 'wechat.message.push', 'publishing', 'old', UTC_TIMESTAMP(6) - INTERVAL 1 MINUTE, '2000-01-01 00:00:00', '2000-01-01 00:00:00')`,
 		id)
 	if err != nil {
 		t.Fatal(err)

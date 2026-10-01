@@ -157,6 +157,9 @@ func (s *Service) CompleteUpload(ctx context.Context, owner int64, id string) (i
 		return err
 	})
 	if err != nil {
+		if apperrors.AsApp(err).Code == apperrors.StateConflict {
+			return s.waitForConcurrentComplete(ctx, owner, id)
+		}
 		return 0, err
 	}
 	if alreadyCompleted {
@@ -223,6 +226,31 @@ func (s *Service) CompleteUpload(ctx context.Context, owner int64, id string) (i
 		_ = s.store.Delete(ctx, chunkKey(id, n))
 	}
 	return winner, nil
+}
+
+func (s *Service) waitForConcurrentComplete(ctx context.Context, owner int64, id string) (int64, error) {
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		row, err := s.sessionFor(ctx, owner, id)
+		if err != nil {
+			return 0, err
+		}
+		if row.Status == SessionCompleted {
+			return row.MediaObjectID, nil
+		}
+		if row.Status != SessionAssembling {
+			return 0, apperrors.Conflict("upload session is " + row.Status)
+		}
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	return 0, apperrors.Conflict("another upload assembly is still in progress")
 }
 
 func (s *Service) releaseAssembly(ctx context.Context, id, assemblyOwner string) error {

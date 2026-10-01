@@ -521,6 +521,56 @@ func TestGCTaskCleansUnreferencedObject(t *testing.T) {
 	}
 }
 
+func TestMessageAssetGrantsConversationParticipants(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	owner, participant := e.newUser(t), e.newUser(t)
+	data := pngBytes(t)
+	objectID, _ := e.upload(t, owner, data, PurposeMessage, "application/octet-stream", shaOf(data))
+
+	err := mysqlx.WithinTx(ctx, e.db, func(tx mysqlx.Tx) error {
+		return e.svc.BindMessageAssetTx(ctx, tx, 12345, objectID, []int64{owner, participant})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.svc.DownloadURL(ctx, participant, objectID); err != nil {
+		t.Fatalf("participant download: %v", err)
+	}
+	stranger := e.newUser(t)
+	if _, err := e.svc.DownloadURL(ctx, stranger, objectID); codeOf(t, err) != apperrors.Forbidden {
+		t.Fatalf("stranger download: %v", err)
+	}
+}
+
+func TestGCTaskWaitsForPurgeAfter(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	owner := e.newUser(t)
+	objectID, _ := e.upload(t, owner, pngBytes(t), PurposeMessage, "application/octet-stream", shaOf(pngBytes(t)))
+	obj, err := findObject(ctx, e.db, objectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	purgeAfter := e.clk.Now().Add(7 * 24 * time.Hour)
+	err = mysqlx.WithinTx(ctx, e.db, func(tx mysqlx.Tx) error {
+		return e.svc.EnqueueGCTx(ctx, tx, []int64{objectID}, purgeAfter)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := e.svc.ProcessGCTasks(ctx, 10); err != nil || n != 0 {
+		t.Fatalf("before purge: processed=%d err=%v, want 0/nil", n, err)
+	}
+	e.clk.Advance(7 * 24 * time.Hour)
+	if n, err := e.svc.ProcessGCTasks(ctx, 10); err != nil || n != 1 {
+		t.Fatalf("after purge: processed=%d err=%v, want 1/nil", n, err)
+	}
+	if exists, err := e.store.Exists(ctx, obj.BucketKey); err != nil || exists {
+		t.Fatalf("object exists=%v err=%v, want false/nil", exists, err)
+	}
+}
+
 // SPEC-01 R27: the avatar binding validates ownership, status, type and size,
 // and commits references + profile atomically.
 func TestR27AvatarBinding(t *testing.T) {

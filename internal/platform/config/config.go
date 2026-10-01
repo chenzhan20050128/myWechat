@@ -13,15 +13,16 @@ import (
 
 // Config is the root configuration for all three processes (api/gateway/worker).
 type Config struct {
-	HTTP     HTTP
-	MySQL    MySQL
-	Cache    Cache
-	Storage  Storage
-	MQ       MQ
-	Auth     Auth
-	Secret   Secret
-	Log      Log
-	Operator Operator
+	HTTP      HTTP
+	MySQL     MySQL
+	Cache     Cache
+	Storage   Storage
+	MQ        MQ
+	Auth      Auth
+	Secret    Secret
+	Log       Log
+	Operator  Operator
+	RateLimit RateLimit
 }
 
 // Operator holds the phase-6 operator whitelist (SPEC-09 R1). Before the
@@ -96,6 +97,12 @@ type Log struct {
 	Format string // json | text
 }
 
+type RateLimit struct {
+	// Enabled is false only for explicit load-test runs. Production must
+	// leave this unset so the default true applies.
+	Enabled bool
+}
+
 // Load parses WECHAT_* environment variables and validates them (R1, R2).
 func Load() (*Config, error) {
 	c := &Config{
@@ -148,6 +155,9 @@ func Load() (*Config, error) {
 		Log: Log{
 			Level:  env("WECHAT_LOG_LEVEL", "info"),
 			Format: env("WECHAT_LOG_FORMAT", "json"),
+		},
+		RateLimit: RateLimit{
+			Enabled: envBool("WECHAT_RATE_LIMIT_ENABLED", true),
 		},
 		Operator: Operator{
 			IDs: parseIDList(env("WECHAT_OPERATOR_IDS", "")),

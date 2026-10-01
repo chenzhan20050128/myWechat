@@ -478,6 +478,15 @@ func findActiveSession(ctx context.Context, db mysqlx.DBTX, accountID, userID in
 	return &r, nil
 }
 
+func lockOfficialAccount(ctx context.Context, tx mysqlx.Tx, accountID int64) error {
+	var one int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT 1 FROM official_accounts WHERE id = ? FOR UPDATE`, accountID).Scan(&one); err != nil {
+		return fmt.Errorf("content: lock account: %w", err)
+	}
+	return nil
+}
+
 func findSession(ctx context.Context, db mysqlx.DBTX, id int64) (*SessionRow, error) {
 	var r SessionRow
 	err := db.QueryRowContext(ctx,

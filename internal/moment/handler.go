@@ -329,7 +329,8 @@ func (h *Handler) AddComment(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, r, http.StatusOK, map[string]any{"comment_id": strconv.FormatInt(c.ID, 10)})
 }
 
-// DeleteComment handles DELETE /api/v1/moments/comments/{id} (C10).
+// DeleteComment handles DELETE /api/v1/moment-comments/{id}. The path avoids
+// an overlap with DELETE /api/v1/moments/{id}/like in Go's ServeMux.
 func (h *Handler) DeleteComment(w http.ResponseWriter, r *http.Request) {
 	p, err := httpx.MustPrincipal(r.Context())
 	if err != nil {
@@ -475,11 +476,11 @@ func Mount(mux *http.ServeMux, h *Handler, wrapWrite, wrapRead func(http.Handler
 	mux.Handle("DELETE /api/v1/moments/{id}/like", wrapWrite(h.Unlike))
 	mux.Handle("GET /api/v1/moments/{id}/likes", wrapRead(h.Likes))
 	mux.Handle("POST /api/v1/moments/{id}/comments", wrapWrite(h.AddComment))
-	mux.Handle("DELETE /api/v1/moments/comments/{id}", wrapWrite(h.DeleteComment))
+	mux.Handle("DELETE /api/v1/moment-comments/{id}", wrapWrite(h.DeleteComment))
 	mux.Handle("GET /api/v1/moments/{id}/comments", wrapRead(h.Comments))
 	mux.Handle("GET /api/v1/moments/notifications", wrapRead(h.Notifications))
 	mux.Handle("POST /api/v1/moments/notifications/read", wrapWrite(h.MarkNotificationsRead))
 	mux.Handle("GET /api/v1/moments/schedules", wrapRead(h.ListSchedules))
-	mux.Handle("DELETE /api/v1/moments/schedules/{id}", wrapWrite(h.CancelSchedule))
+	mux.Handle("DELETE /api/v1/moment-schedules/{id}", wrapWrite(h.CancelSchedule))
 	mux.Handle("POST /api/v1/moments/schedules/{id}/retry", wrapWrite(h.RetrySchedule))
 }

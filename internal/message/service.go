@@ -914,9 +914,14 @@ func (s *Service) ListConversations(ctx context.Context, userID int64) ([]Conver
 		if err != nil {
 			return nil, err
 		}
-		title, err := titleOf(id)
-		if err != nil {
-			return nil, err
+		title := ""
+		if ct == "transfer" {
+			title = "文件传输助手"
+		} else {
+			title, err = titleOf(id)
+			if err != nil {
+				return nil, err
+			}
 		}
 		last, err := lastLiveMessage(ctx, s.db, id)
 		if err != nil {

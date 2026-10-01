@@ -495,6 +495,9 @@ func (s *Service) StartSession(ctx context.Context, accountID, userID int64) (*S
 	now := s.now()
 	var result *StartSessionResult
 	err = mysqlx.WithinTx(ctx, s.db, func(tx mysqlx.Tx) error {
+		if err := lockOfficialAccount(ctx, tx, accountID); err != nil {
+			return err
+		}
 		existing, err := findActiveSession(ctx, tx, accountID, userID)
 		if err != nil {
 			return err

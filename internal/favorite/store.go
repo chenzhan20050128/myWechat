@@ -13,17 +13,17 @@ import (
 
 // Row is a favorites row.
 type Row struct {
-	ID               int64
-	OwnerID          int64
-	Kind             string
-	Content          json.RawMessage
-	SourceMessageID  *int64
-	SourceSenderID   *int64
-	SourceSentAt     *time.Time
-	SourceType       string
-	TotalSize        int64
-	Status           string
-	CreatedAt        time.Time
+	ID              int64
+	OwnerID         int64
+	Kind            string
+	Content         json.RawMessage
+	SourceMessageID *int64
+	SourceSenderID  *int64
+	SourceSentAt    *time.Time
+	SourceType      string
+	TotalSize       int64
+	Status          string
+	CreatedAt       time.Time
 }
 
 // TagRow is a favorite_tags row.
@@ -34,23 +34,23 @@ type TagRow struct {
 
 // JobRow is a storage_cleanup_jobs row.
 type JobRow struct {
-	ID          int64
-	UserID      int64
-	Scope       string
-	Filter      json.RawMessage
-	Preview     json.RawMessage
-	Status      string
-	CreatedAt   time.Time
+	ID        int64
+	UserID    int64
+	Scope     string
+	Filter    json.RawMessage
+	Preview   json.RawMessage
+	Status    string
+	CreatedAt time.Time
 }
 
 // ItemRow is a storage_cleanup_items row.
 type ItemRow struct {
-	ItemID         int64
-	CleanupID      int64
-	UserRefID      int64
-	MediaObjectID  int64
-	State          string
-	Error          string
+	ItemID        int64
+	CleanupID     int64
+	UserRefID     int64
+	MediaObjectID int64
+	State         string
+	Error         string
 }
 
 func insertFavorite(ctx context.Context, tx mysqlx.Tx, r *Row, now time.Time) (int64, error) {

@@ -248,7 +248,7 @@ func (h *Handler) Forward(w http.ResponseWriter, r *http.Request) {
 	}
 	var body struct {
 		TargetConversationIDs []string `json:"target_conversation_ids"`
-		ClientMsgIDs         []string `json:"client_msg_ids"`
+		ClientMsgIDs          []string `json:"client_msg_ids"`
 	}
 	if err := httpx.DecodeBody(r, &body); err != nil {
 		httpx.Error(w, r, err)
@@ -348,18 +348,20 @@ func (h *Handler) ListPins(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, r, http.StatusOK, map[string]any{"pins": items})
 }
 
-// Mount wires all A1-A12 routes.
-func Mount(mux *http.ServeMux, h *Handler, wrap func(http.HandlerFunc) http.Handler) {
-	mux.Handle("POST /api/v1/conversations/{id}/messages", wrap(h.Send))
-	mux.Handle("GET /api/v1/conversations/{id}/messages", wrap(h.History))
-	mux.Handle("GET /api/v1/conversations", wrap(h.ListConversations))
-	mux.Handle("GET /api/v1/conversations/{id}", wrap(h.GetConversation))
-	mux.Handle("POST /api/v1/conversations/{id}/read", wrap(h.Read))
-	mux.Handle("POST /api/v1/conversations/{id}/mark-unread", wrap(h.MarkUnread))
-	mux.Handle("PATCH /api/v1/conversations/{id}/settings", wrap(h.UpdateSettings))
-	mux.Handle("POST /api/v1/messages/{id}/recall", wrap(h.Recall))
-	mux.Handle("POST /api/v1/messages/{id}/forward", wrap(h.Forward))
-	mux.Handle("POST /api/v1/conversations/{id}/pins", wrap(h.Pin))
-	mux.Handle("DELETE /api/v1/conversations/{id}/pins/{message_id}", wrap(h.Unpin))
-	mux.Handle("GET /api/v1/conversations/{id}/pins", wrap(h.ListPins))
+// Mount wires all A1-A12 routes. Read paths use the read budget, Send uses the
+// dedicated message budget, and remaining mutations use the general write
+// budget.
+func Mount(mux *http.ServeMux, h *Handler, wrapWrite, wrapRead, wrapSend func(http.HandlerFunc) http.Handler) {
+	mux.Handle("POST /api/v1/conversations/{id}/messages", wrapSend(h.Send))
+	mux.Handle("GET /api/v1/conversations/{id}/messages", wrapRead(h.History))
+	mux.Handle("GET /api/v1/conversations", wrapRead(h.ListConversations))
+	mux.Handle("GET /api/v1/conversations/{id}", wrapRead(h.GetConversation))
+	mux.Handle("POST /api/v1/conversations/{id}/read", wrapWrite(h.Read))
+	mux.Handle("POST /api/v1/conversations/{id}/mark-unread", wrapWrite(h.MarkUnread))
+	mux.Handle("PATCH /api/v1/conversations/{id}/settings", wrapWrite(h.UpdateSettings))
+	mux.Handle("POST /api/v1/messages/{id}/recall", wrapWrite(h.Recall))
+	mux.Handle("POST /api/v1/messages/{id}/forward", wrapWrite(h.Forward))
+	mux.Handle("POST /api/v1/conversations/{id}/pins", wrapWrite(h.Pin))
+	mux.Handle("DELETE /api/v1/conversations/{id}/pins/{message_id}", wrapWrite(h.Unpin))
+	mux.Handle("GET /api/v1/conversations/{id}/pins", wrapRead(h.ListPins))
 }

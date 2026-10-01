@@ -116,6 +116,17 @@ func (s *Service) CreateRequest(ctx context.Context, in CreateRequestInput) (Req
 
 	var row RequestRow
 	err = mysqlx.WithinTx(ctx, s.db, func(tx mysqlx.Tx) error {
+		if _, err := lockEpochRow(ctx, tx, lo, hi); err != nil {
+			return err
+		}
+		if _, ok, err := activeFriendship(ctx, tx, lo, hi); err != nil {
+			return err
+		} else if ok {
+			return apperrors.New(apperrors.AlreadyFriend, "already friends")
+		}
+		if err := s.assertNotBlockedTx(ctx, tx, in.ApplicantID, targetID); err != nil {
+			return err
+		}
 		id, err := upsertPendingRequest(ctx, tx, in, targetID, s.now.Now())
 		if err != nil {
 			return apperrors.Wrap(apperrors.InternalError, "create friend request", err)
@@ -189,14 +200,18 @@ func (s *Service) resolveTarget(ctx context.Context, in CreateRequestInput) (int
 
 // assertNotBlocked enforces R5 in both directions (contract §4.4).
 func (s *Service) assertNotBlocked(ctx context.Context, applicant, target int64) error {
-	byTarget, err := loadSettings(ctx, s.db, target, []int64{applicant})
+	return s.assertNotBlockedTx(ctx, s.db, applicant, target)
+}
+
+func (s *Service) assertNotBlockedTx(ctx context.Context, db mysqlx.DBTX, applicant, target int64) error {
+	byTarget, err := loadSettings(ctx, db, target, []int64{applicant})
 	if err != nil {
 		return err
 	}
 	if settingsOf(byTarget, applicant).MessagePerm == PermBlocked {
 		return apperrors.Unavail("user not found")
 	}
-	byApplicant, err := loadSettings(ctx, s.db, applicant, []int64{target})
+	byApplicant, err := loadSettings(ctx, db, applicant, []int64{target})
 	if err != nil {
 		return err
 	}

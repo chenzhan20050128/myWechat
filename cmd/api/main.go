@@ -114,10 +114,21 @@ func main() {
 	operatorSvc := operator.New(db, operatorWhitelist{ids: cfg.Operator.IDs}, clk.Now)
 
 	// Rate limits (SPEC-12 §7 default table, fail-open).
-	authLimiter := ratelimit.New(cacheStore, "auth", 20, 10*time.Minute)
-	writeLimiter := ratelimit.New(cacheStore, "write", 100, time.Minute)
-	chunkLimiter := ratelimit.New(cacheStore, "media_chunk", 600, time.Minute)
-	readLimiter := ratelimit.New(cacheStore, "read", 300, time.Minute)
+	var authLimiter, writeLimiter, chunkLimiter, readLimiter *ratelimit.Limiter
+	var messageSendLimiter *ratelimit.Limiter
+	if cfg.RateLimit.Enabled {
+		authLimiter = ratelimit.New(cacheStore, "auth", 20, 10*time.Minute)
+		writeLimiter = ratelimit.New(cacheStore, "write", 100, time.Minute)
+		chunkLimiter = ratelimit.New(cacheStore, "media_chunk", 600, time.Minute)
+		readLimiter = ratelimit.New(cacheStore, "read", 300, time.Minute)
+		messageSendLimiter = ratelimit.New(cacheStore, "message_send", 120, time.Minute)
+	} else {
+		authLimiter = ratelimit.NewNoop()
+		writeLimiter = ratelimit.NewNoop()
+		chunkLimiter = ratelimit.NewNoop()
+		readLimiter = ratelimit.NewNoop()
+		messageSendLimiter = ratelimit.NewNoop()
+	}
 
 	var shuttingDown atomic.Bool
 	ready := func(ctx context.Context) error {
@@ -135,7 +146,7 @@ func main() {
 		groups: groups, media: mediaSvc, messages: messages, moments: moments, favorites: favorites,
 		backups: backups, content: contentSvc, operator: operatorSvc,
 		authn: authSvc, ready: ready, trustedProxies: cfg.HTTP.TrustedProxies,
-		limiters: limiters{auth: authLimiter, write: writeLimiter, chunk: chunkLimiter, read: readLimiter},
+		limiters: limiters{auth: authLimiter, write: writeLimiter, chunk: chunkLimiter, read: readLimiter, messageSend: messageSendLimiter},
 	})
 
 	srv := &http.Server{
@@ -191,10 +202,11 @@ type routerServices struct {
 }
 
 type limiters struct {
-	auth  *ratelimit.Limiter
-	write *ratelimit.Limiter
-	chunk *ratelimit.Limiter
-	read  *ratelimit.Limiter
+	auth        *ratelimit.Limiter
+	write       *ratelimit.Limiter
+	chunk       *ratelimit.Limiter
+	read        *ratelimit.Limiter
+	messageSend *ratelimit.Limiter
 }
 
 // groupMessageAdapter adapts *group.Service to message.Group without importing
@@ -394,6 +406,11 @@ func buildRouter(s routerServices) http.Handler {
 	public := func(h http.HandlerFunc) http.Handler {
 		return httpx.RequestID(httpx.Recover(s.limit(s.limiters.auth, h)))
 	}
+	// send applies the dedicated message-send budget before the conversation
+	// row lock, independent of the general write limiter.
+	send := func(h http.HandlerFunc) http.Handler {
+		return httpx.RequestID(httpx.Recover(httpx.RequireAuth(s.authn)(s.limit(s.limiters.messageSend, h))))
+	}
 
 	// Auth (SPEC-01 §4).
 	mux.Handle("POST /api/v1/auth/register", public(authH.Register))
@@ -436,7 +453,7 @@ func buildRouter(s routerServices) http.Handler {
 	group.Mount(mux, groupH, authed)
 
 	// Messages (SPEC-04 §5).
-	message.Mount(mux, messageH, authed)
+	message.Mount(mux, messageH, authed, read, send)
 
 	// Moments (SPEC-06 §8).
 	moment.Mount(mux, momentH, authed, read)

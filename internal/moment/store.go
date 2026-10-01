@@ -422,7 +422,8 @@ func claimDueSchedules(ctx context.Context, tx mysqlx.Tx, worker string, now tim
 		SELECT id, author_id, run_at, status, current_version, execution_version, moment_id, COALESCE(fail_reason,''), retry_count, created_at, updated_at
 		FROM moment_schedules
 		WHERE status = 'scheduled' AND run_at <= ?
-		ORDER BY run_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED`, now)
+		  AND (lease_until IS NULL OR lease_until <= ?)
+		ORDER BY run_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED`, now, now)
 	if err != nil {
 		return nil, err
 	}

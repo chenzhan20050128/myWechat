@@ -12,10 +12,10 @@ import (
 
 // Limiter is a named fixed-window limit.
 type Limiter struct {
-	cache   cache.Cache
-	name    string
-	limit   int64
-	window  time.Duration
+	cache  cache.Cache
+	name   string
+	limit  int64
+	window time.Duration
 }
 
 // New builds a limiter keyed `rl:<name>:<subject>`.
@@ -23,9 +23,18 @@ func New(c cache.Cache, name string, limit int64, window time.Duration) *Limiter
 	return &Limiter{cache: c, name: name, limit: limit, window: window}
 }
 
+// NewNoop builds an explicit unlimited limiter for isolated load-test runs.
+// It must never be selected by a production default.
+func NewNoop() *Limiter {
+	return &Limiter{name: "noop"}
+}
+
 // Allow consumes one unit for subject. Returns (ok, retryAfter).
 // When the cache fails (Incr == -1) the call is allowed (fail-open).
 func (l *Limiter) Allow(ctx context.Context, subject string) (bool, time.Duration) {
+	if l.cache == nil {
+		return true, 0
+	}
 	key := "rl:" + l.name + ":" + subject
 	n := l.cache.Incr(ctx, key, l.window)
 	if n < 0 {

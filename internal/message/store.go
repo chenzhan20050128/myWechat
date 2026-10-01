@@ -662,11 +662,12 @@ func loadSettingsBatch(ctx context.Context, db mysqlx.DBTX, userID int64, conver
 	if len(conversationIDs) == 0 {
 		return out, nil
 	}
+	args := append([]any{userID}, intsToAny(conversationIDs)...)
 	rows, err := db.QueryContext(ctx, `
 		SELECT conversation_id, user_id, pinned, muted, background, last_read_seq, is_marked_unread, unread_anchor_seq, updated_at
 		FROM conversation_settings
 		WHERE user_id = ? AND conversation_id IN (`+mysqlx.Placeholders(len(conversationIDs))+`)`,
-		append([]any{userID}, intsToAny(conversationIDs)...))
+		args...)
 	if err != nil {
 		return nil, err
 	}

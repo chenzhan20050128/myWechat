@@ -182,12 +182,6 @@ func (s *Service) Register(ctx context.Context, req RegisterRequest, ip string) 
 
 // Login authenticates by phone or account_name (R9–R13, R13a).
 func (s *Service) Login(ctx context.Context, req LoginRequest, ip string) (TokenPair, error) {
-	if !validate.Password(req.Password) {
-		// structurally invalid password can never match; burn the argon time
-		// anyway so response timing does not leak validity checks
-		_, _ = argon.Verify(req.Password, dummyHash)
-		return TokenPair{}, invalidCreds()
-	}
 	if err := req.Device.validate(); err != nil {
 		return TokenPair{}, err
 	}
@@ -216,6 +210,16 @@ func (s *Service) Login(ctx context.Context, req LoginRequest, ip string) (Token
 	if _, ok := s.cache.Get(ctx, lockKey); ok {
 		s.audit.Log(ctx, s.db, audit.Entry{Type: "auth.login.failure", ActorID: acct.ID, IP: ip,
 			Detail: map[string]any{"reason": "frozen"}})
+		return TokenPair{}, invalidCreds()
+	}
+
+	if !validate.Password(req.Password) {
+		// Structurally invalid passwords still count as login failures; they
+		// must not provide an uncounted brute-force path.
+		_, _ = argon.Verify(req.Password, dummyHash)
+		s.recordFailure(ctx, acct.ID)
+		s.audit.Log(ctx, s.db, audit.Entry{Type: "auth.login.failure", ActorID: acct.ID, IP: ip,
+			Detail: map[string]any{"reason": "bad_password"}})
 		return TokenPair{}, invalidCreds()
 	}
 
@@ -299,13 +303,14 @@ func (s *Service) Refresh(ctx context.Context, refreshToken, ip string) (TokenPa
 	newRefreshHash := ids.SHA256Hex(refresh)
 
 	var pair TokenPair
+	lostRotation := false
 	err = mysqlx.WithinTx(ctx, s.db, func(tx mysqlx.Tx) error {
 		if err := s.devices.RotateSessionTx(ctx, tx, sess.ID, hash,
 			newAccessHash, now.Add(s.cfg.AccessTTL), newRefreshHash, now.Add(s.cfg.RefreshTTL)); err != nil {
 			if errors.Is(err, device.ErrConcurrentRotation) {
-				// lost race: another request rotated first; presenting the
-				// already-rotated token is reuse → revoke (conservative, D2)
-				_ = s.devices.RevokeSession(ctx, sess.ID, "refresh_reuse")
+				// Revoke only after this transaction rolls back; revoking on
+				// another connection here would wait for the row lock we hold.
+				lostRotation = true
 				return apperrors.Unauth("invalid refresh token")
 			}
 			return apperrors.Wrap(apperrors.InternalError, "rotate session", err)
@@ -322,6 +327,9 @@ func (s *Service) Refresh(ctx context.Context, refreshToken, ip string) (TokenPa
 		return nil
 	})
 	if err != nil {
+		if lostRotation {
+			_ = s.devices.RevokeSession(ctx, sess.ID, "refresh_reuse")
+		}
 		return TokenPair{}, err
 	}
 	// old access token is dead (single-active-token, D1): purge its cache entry

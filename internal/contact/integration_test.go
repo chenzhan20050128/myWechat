@@ -15,6 +15,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -399,6 +400,53 @@ func TestA4RejectCancelAndEpochBump(t *testing.T) {
 			t.Fatalf("settings were not reset on the new epoch: %+v", entries)
 		}
 	})
+}
+
+func TestCreateRequestRacingAcceptCannotBypassFriendship(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	a, b := e.newUser(t), e.newUser(t)
+	row := e.apply(t, a, b, "race")
+
+	const creators = 8
+	createErrs := make([]error, creators)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, _ = e.svc.AcceptRequest(ctx, b.ID, row.ID, "127.0.0.1")
+	}()
+	for i := 0; i < creators; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, createErrs[i] = e.svc.CreateRequest(ctx, CreateRequestInput{
+				ApplicantID: a.ID, Source: SourcePhone, Phone: b.Phone,
+			})
+		}(i)
+	}
+	wg.Wait()
+
+	if epoch, ok, err := e.svc.GetActiveFriendship(ctx, a.ID, b.ID); err != nil || !ok {
+		t.Fatalf("friendship=(%d,%v,%v), want accepted friendship", epoch, ok, err)
+	}
+	var pending int
+	if err := e.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM friend_requests WHERE applicant_id=? AND target_id=? AND status='pending'`,
+		a.ID, b.ID).Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	if pending != 0 {
+		t.Fatalf("pending requests after accept = %d, want 0", pending)
+	}
+	for i, err := range createErrs {
+		if err == nil {
+			continue
+		}
+		if code := codeOf(t, err); code != apperrors.AlreadyFriend {
+			t.Fatalf("creator %d error code = %s, want ALREADY_FRIEND", i, code)
+		}
+	}
 }
 
 // A5 / R5, R18: a block forbids new applications and silences messages.
